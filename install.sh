@@ -28,7 +28,7 @@ else
   exit 1
 fi
 
-log() { echo "[install] $*" >&2; }
+log() { echo "$*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
 log_section() {
