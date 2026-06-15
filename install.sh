@@ -773,8 +773,23 @@ log_influx_credentials() {
   local org="$1"
   local bucket="$2"
   local token="$3"
-  log "InfluxDB 設定：INFLUX_URL=${INFLUX_HOST} INFLUX_ORG=$org INFLUX_BUCKET=$bucket"
-  log "INFLUX_TOKEN=$token"
+  log "InfluxDB 設定："
+  log "  INFLUX_URL=${INFLUX_HOST}"
+  log "  INFLUX_ORG=$org"
+  log "  INFLUX_BUCKET=$bucket"
+  log "  INFLUX_TOKEN=$token"
+}
+
+log_mqtt_defaults() {
+  local mqtt_url="$1"
+  local mqtt_user="$2"
+  local monitor_only="$3"
+  local poll_ms="$4"
+  log "MQTT 預設："
+  log "  MQTT_URL=$mqtt_url"
+  log "  MQTT_USERNAME=$mqtt_user"
+  log "  MONITOR_ONLY=$monitor_only"
+  log "  POLL_INTERVAL_MS=$poll_ms"
 }
 
 # 回傳 org|bucket|token（InfluxDB 為必填，供本地 7 天緩存）
@@ -1021,7 +1036,7 @@ write_env_file() {
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
   slave_ids="${slave_ids//[\[\]]/}"
 
-  log "MQTT 預設：MQTT_URL=$mqtt_url MQTT_USERNAME=$mqtt_user MONITOR_ONLY=$monitor_only POLL_INTERVAL_MS=$poll_ms"
+  log_mqtt_defaults "$mqtt_url" "$mqtt_user" "$monitor_only" "$poll_ms"
   mqtt_pass="$(prompt_secret "請輸入 MQTT_PASSWORD（Broker 密碼；直接 Enter 表示空密碼）")"
   if [[ -z "$mqtt_pass" && -z "${DEFAULT_MQTT_PASSWORD:-}" ]]; then
     log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
@@ -1405,6 +1420,24 @@ start_service() {
   fi
 }
 
+finish_install_success() {
+  local mode="${1:-install}"
+  echo
+  if [[ "$mode" == "update" ]]; then
+    log "✅ 更新完成"
+  else
+    log "✅ 安裝完成"
+    echo "   安裝目錄：$INSTALL_DIR"
+    echo "   管理工具：$INSTALL_DIR/dpm-ctl.sh status"
+    echo "   查看日誌：$INSTALL_DIR/dpm-ctl.sh logs"
+  fi
+  echo
+  log "接下來顯示即時日誌，可按 Ctrl+C 離開（不影響服務運行）"
+  "$INSTALL_DIR/dpm-ctl.sh" logs -n 30 || true
+  sleep 5
+  "$INSTALL_DIR/dpm-ctl.sh" status || true
+}
+
 main() {
   require_root
   detect_system
@@ -1419,7 +1452,7 @@ main() {
     validate_runtime_config "$INSTALL_DIR"
     fix_permissions
     start_service
-    log "✅ 更新完成"
+    finish_install_success update
     exit 0
   fi
 
@@ -1438,12 +1471,7 @@ main() {
   validate_runtime_config "$INSTALL_DIR"
   fix_permissions
   start_service
-
-  echo
-  log "✅ 安裝完成"
-  echo "   安裝目錄：$INSTALL_DIR"
-  echo "   管理工具：$INSTALL_DIR/dpm-ctl.sh status"
-  echo "   查看日誌：$INSTALL_DIR/dpm-ctl.sh logs"
+  finish_install_success install
 }
 
 main "$@"
