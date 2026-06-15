@@ -137,23 +137,63 @@ install_influxdb_apt() {
 
 INFLUX_HOST="${INFLUX_HOST:-http://127.0.0.1:8086}"
 
+find_http_client() {
+  local name="$1"
+  local c
+  for c in "/usr/bin/$name" "/bin/$name"; do
+    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  command -v "$name" 2>/dev/null || true
+}
+
+ensure_influx_http_client() {
+  find_http_client curl >/dev/null && return 0
+  find_http_client wget >/dev/null && return 0
+  apt-get update -qq
+  apt-get install -y curl
+}
+
 influx_cli() {
   INFLUX_HOST="$INFLUX_HOST" influx "$@"
 }
 
 influx_http_healthy() {
-  ensure_influx_http_client
-  local body=""
-  if command -v curl >/dev/null 2>&1; then
-    body="$(curl -sf "${INFLUX_HOST}/health" 2>/dev/null || true)"
-  elif command -v wget >/dev/null 2>&1; then
-    body="$(wget -qO- "${INFLUX_HOST}/health" 2>/dev/null || true)"
+  local curl_bin wget_bin body
+  curl_bin="$(find_http_client curl)"
+  if [[ -n "$curl_bin" ]]; then
+    body="$("$curl_bin" -sf "${INFLUX_HOST}/health" 2>/dev/null || true)"
+    if [[ -n "$body" ]] && echo "$body" | grep -q '"pass"'; then
+      return 0
+    fi
   fi
-  [[ -n "$body" ]] && echo "$body" | grep -qE '"status"[[:space:]]*:[[:space:]]*"pass"'
+  wget_bin="$(find_http_client wget)"
+  if [[ -n "$wget_bin" ]]; then
+    body="$("$wget_bin" -qO- "${INFLUX_HOST}/health" 2>/dev/null || true)"
+    if [[ -n "$body" ]] && echo "$body" | grep -q '"pass"'; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
 influx_reachable() {
-  influx_http_healthy || influx_cli ping >/dev/null 2>&1
+  if influx_http_healthy; then
+    return 0
+  fi
+  INFLUX_HOST="$INFLUX_HOST" influx ping >/dev/null 2>&1
+}
+
+log_influx_reachability_debug() {
+  local curl_bin body ping_out
+  curl_bin="$(find_http_client curl)"
+  log "除錯：INFLUX_HOST=$INFLUX_HOST PATH=$PATH"
+  log "除錯：curl=${curl_bin:-（找不到，請 apt install curl）}"
+  if [[ -n "$curl_bin" ]]; then
+    body="$("$curl_bin" -sf "${INFLUX_HOST}/health" 2>&1 || true)"
+    log "除錯：GET ${INFLUX_HOST}/health → ${body:-（空）}"
+  fi
+  ping_out="$(INFLUX_HOST="$INFLUX_HOST" influx ping 2>&1 | head -c 160 || true)"
+  log "除錯：INFLUX_HOST=$INFLUX_HOST influx ping → ${ping_out:-（空）}"
 }
 
 influx_is_initialized() {
@@ -161,20 +201,15 @@ influx_is_initialized() {
 }
 
 fetch_influx_setup_status() {
-  local body=""
-  if command -v curl >/dev/null 2>&1; then
-    body="$(curl -sf "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
-  elif command -v wget >/dev/null 2>&1; then
-    body="$(wget -qO- "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
+  local curl_bin wget_bin body=""
+  curl_bin="$(find_http_client curl)"
+  if [[ -n "$curl_bin" ]]; then
+    body="$("$curl_bin" -sf "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
+  else
+    wget_bin="$(find_http_client wget)"
+    [[ -n "$wget_bin" ]] && body="$("$wget_bin" -qO- "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
   fi
   printf '%s' "$body"
-}
-
-ensure_influx_http_client() {
-  command -v curl >/dev/null 2>&1 && return 0
-  command -v wget >/dev/null 2>&1 && return 0
-  apt-get update -qq
-  apt-get install -y curl
 }
 
 influx_server_needs_setup() {
@@ -196,6 +231,7 @@ influx_server_needs_setup() {
 }
 
 wait_for_influx_ping() {
+  ensure_influx_http_client
   local i
   for i in $(seq 1 20); do
     if influx_reachable; then
@@ -203,6 +239,7 @@ wait_for_influx_ping() {
     fi
     sleep 1
   done
+  log_influx_reachability_debug
   return 1
 }
 
@@ -538,6 +575,7 @@ verify_influxdb_ready() {
     die "InfluxDB 服務未運行（本地緩存必填）"
   fi
   if ! influx_reachable; then
+    log_influx_reachability_debug
     die "InfluxDB 無法連線；請檢查 systemctl status influxdb 與 curl ${INFLUX_HOST}/health"
   fi
 }
