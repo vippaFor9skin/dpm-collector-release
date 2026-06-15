@@ -130,8 +130,203 @@ install_influxdb_apt() {
   log "InfluxDB 服務已啟動"
 }
 
+INFLUX_HOST="${INFLUX_HOST:-http://127.0.0.1:8086}"
+
+influx_cli() {
+  influx --host "$INFLUX_HOST" "$@"
+}
+
 influx_is_initialized() {
-  influx ping >/dev/null 2>&1 && influx org list >/dev/null 2>&1
+  influx_cli ping >/dev/null 2>&1 && influx_cli org list >/dev/null 2>&1
+}
+
+get_active_influx_token() {
+  local raw
+  raw="$(influx config list --json 2>/dev/null | node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const j=JSON.parse(s);
+    const list=Array.isArray(j)?j:(j.configs?Object.entries(j.configs).map(([n,c])=>({name:n,...c})):[]);
+    const active=list.find((c)=>c.active===true||c.active==='true')||list[0];
+    if(active&&active.token) process.stdout.write(String(active.token));
+  } catch {}
+});
+" 2>/dev/null || true)"
+  trim_value "$raw"
+}
+
+detect_influx_org() {
+  local preferred="$1"
+  local detected
+  detected="$(influx_cli org list --hide-headers --json 2>/dev/null | node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const arr=JSON.parse(s);
+    const names=(Array.isArray(arr)?arr:[]).map((o)=>o.name).filter(Boolean);
+    const pref=process.argv[1];
+    if(names.includes(pref)){ process.stdout.write(pref); return; }
+    if(names[0]) process.stdout.write(names[0]);
+  } catch {}
+});
+" "$preferred" 2>/dev/null || true)"
+  detected="$(trim_value "$detected")"
+  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
+}
+
+detect_influx_bucket() {
+  local org="$1"
+  local preferred="$2"
+  local detected
+  detected="$(influx_cli bucket list --org "$org" --hide-headers --json 2>/dev/null | node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const arr=JSON.parse(s);
+    const names=(Array.isArray(arr)?arr:[]).map((b)=>b.name).filter(Boolean);
+    const pref=process.argv[1];
+    if(names.includes(pref)){ process.stdout.write(pref); return; }
+    if(names[0]) process.stdout.write(names[0]);
+  } catch {}
+});
+" "$preferred" 2>/dev/null || true)"
+  detected="$(trim_value "$detected")"
+  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
+}
+
+save_influx_admin_token() {
+  local admin_file="$1"
+  local org="$2"
+  local bucket="$3"
+  local token="$4"
+  if [[ -f "$admin_file" ]]; then
+    if grep -q '^Token:' "$admin_file"; then
+      sed -i "s|^Token:.*|Token: $token|" "$admin_file"
+    else
+      printf '\nToken: %s\n' "$token" >> "$admin_file"
+    fi
+    if grep -q '^Org:' "$admin_file"; then
+      sed -i "s|^Org:.*|Org: $org|" "$admin_file"
+    fi
+    if grep -q '^Bucket:' "$admin_file"; then
+      sed -i "s|^Bucket:.*|Bucket: $bucket|" "$admin_file"
+    fi
+  else
+    cat > "$admin_file" <<EOF
+InfluxDB 管理資訊（請妥善保存，勿提交 git）
+Org: $org
+Bucket: $bucket
+Token: $token
+Retention: ${INFLUX_RETENTION_HOURS}h
+EOF
+  fi
+  chmod 600 "$admin_file"
+}
+
+influx_auth_create_token() {
+  local org="$1"
+  local bucket="$2"
+  local token="$3"
+  local desc="$4"
+  local op_token err_log rc
+
+  err_log="$(mktemp)"
+  op_token="$(get_active_influx_token)"
+
+  if [[ -n "$op_token" ]]; then
+    if INFLUX_TOKEN="$op_token" influx_cli auth create \
+      --org "$org" \
+      --token "$token" \
+      --description "$desc" \
+      --read-bucket "$bucket" \
+      --write-bucket "$bucket" 2>"$err_log"; then
+      rm -f "$err_log"
+      return 0
+    fi
+  fi
+
+  if influx_cli auth create \
+    --org "$org" \
+    --token "$token" \
+    --description "$desc" \
+    --read-bucket "$bucket" \
+    --write-bucket "$bucket" 2>"$err_log"; then
+    rm -f "$err_log"
+    return 0
+  fi
+
+  rc=$?
+  log "influx auth create 失敗（exit $rc）：$(tr '\n' ' ' < "$err_log" | head -c 240)"
+  rm -f "$err_log"
+  return 1
+}
+
+influx_setup_force_rebind() {
+  local username="$1"
+  local password="$2"
+  local org="$3"
+  local bucket="$4"
+  local token="$5"
+  influx_cli setup \
+    --username "$username" \
+    --password "$password" \
+    --org "$org" \
+    --bucket "$bucket" \
+    --retention "${INFLUX_RETENTION_HOURS}h" \
+    --token "$token" \
+    --force
+}
+
+create_collector_influx_token() {
+  local org="$1"
+  local bucket="$2"
+  local token desc admin_file
+  admin_file="/root/dpm-collector-influx-admin.txt"
+  token="$(openssl rand -hex 32)"
+  desc="dpm-collector-$(date +%Y%m%d%H%M%S)"
+
+  org="$(detect_influx_org "$org")"
+  bucket="$(detect_influx_bucket "$org" "$bucket")"
+
+  if influx_auth_create_token "$org" "$bucket" "$token" "$desc"; then
+    save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
+    printf '%s|%s|%s' "$org" "$bucket" "$token"
+    return 0
+  fi
+
+  if [[ -f "$admin_file" ]]; then
+    local admin_user admin_pass file_org file_bucket
+    admin_user="$(sed -n 's/^Username:[[:space:]]*//p' "$admin_file" | head -n1)"
+    admin_pass="$(sed -n 's/^Password:[[:space:]]*//p' "$admin_file" | head -n1)"
+    file_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
+    file_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
+    [[ -n "$file_org" ]] && org="$file_org"
+    [[ -n "$file_bucket" ]] && bucket="$file_bucket"
+    if [[ -n "$admin_user" && -n "$admin_pass" ]]; then
+      log "改用 influx setup --force 重新綁定 CLI 並建立 Token …"
+      if influx_setup_force_rebind "$admin_user" "$admin_pass" "$org" "$bucket" "$token"; then
+        save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
+        printf '%s|%s|%s' "$org" "$bucket" "$token"
+        return 0
+      fi
+    fi
+  fi
+
+  token="$(get_active_influx_token)"
+  if [[ -n "$token" ]]; then
+    log "⚠️  無法建立新 Token，沿用 Influx CLI 已登入 Token（僅本機 127.0.0.1）"
+    org="$(detect_influx_org "$org")"
+    bucket="$(detect_influx_bucket "$org" "$bucket")"
+    save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
+    printf '%s|%s|%s' "$org" "$bucket" "$token"
+    return 0
+  fi
+
+  return 1
 }
 
 init_influxdb() {
@@ -218,22 +413,26 @@ EOF
     log "沿用既有 InfluxDB 設定"
   else
     log "InfluxDB 已初始化，自動建立採集程式 API Token …"
-    influx_token="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
-    influx_token="$(trim_value "$influx_token")"
-    if [[ -z "$influx_token" && -f "$admin_file" ]]; then
+    local created
+    created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
+    if [[ -n "$created" ]]; then
+      IFS='|' read -r influx_org influx_bucket influx_token <<< "$created"
+    else
       influx_token="$(trim_value "$(sed -n 's/^Token:[[:space:]]*//p' "$admin_file" | head -n1)")"
-      influx_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
-      influx_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
-      [[ -n "$influx_token" ]] && log "沿用 $admin_file 內 Token"
+      if [[ -n "$influx_token" ]]; then
+        influx_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
+        influx_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
+        log "沿用 $admin_file 內 Token"
+      fi
     fi
-    [[ -n "$influx_token" ]] || die "無法建立 InfluxDB Token；請確認 influx CLI 可用，或查看 $admin_file"
+    [[ -n "$influx_token" ]] || die "無法建立 InfluxDB Token。請執行：sudo influx auth list；或查看 $admin_file"
   fi
 
   influx_token="$(trim_value "$influx_token")"
   [[ -n "$influx_token" ]] || die "INFLUX_TOKEN 不可為空"
 
-  if ! influx ping >/dev/null 2>&1; then
-    die "InfluxDB 無法連線（http://127.0.0.1:8086）"
+  if ! influx_cli ping >/dev/null 2>&1; then
+    die "InfluxDB 無法連線（${INFLUX_HOST}）"
   fi
 
   echo "$influx_org|$influx_bucket|$influx_token"
@@ -243,7 +442,7 @@ verify_influxdb_ready() {
   if ! systemctl is-active --quiet influxdb 2>/dev/null; then
     die "InfluxDB 服務未運行（本地緩存必填）"
   fi
-  if ! influx ping >/dev/null 2>&1; then
+  if ! influx_cli ping >/dev/null 2>&1; then
     die "InfluxDB 無法 ping；請檢查 systemctl status influxdb"
   fi
 }
@@ -276,57 +475,6 @@ trim_value() {
   v="${v#"${v%%[![:space:]]*}"}"
   v="${v%"${v##*[![:space:]]}"}"
   printf '%s' "$v"
-}
-
-create_collector_influx_token() {
-  local org="$1"
-  local bucket="$2"
-  local token desc
-  token="$(openssl rand -hex 32)"
-  desc="dpm-collector-$(date +%Y%m%d%H%M%S)"
-
-  if influx auth create \
-    --org "$org" \
-    --token "$token" \
-    --description "$desc" \
-    --read-bucket "$bucket" \
-    --write-bucket "$bucket" >/dev/null 2>&1; then
-    printf '%s' "$token"
-    return 0
-  fi
-
-  # 若 CLI 未登入，嘗試用管理員帳密重新連線（沿用既有 Influx 資料）
-  local admin_file="/root/dpm-collector-influx-admin.txt"
-  if [[ -f "$admin_file" ]]; then
-    local admin_user admin_pass file_org file_bucket
-    admin_user="$(sed -n 's/^Username:[[:space:]]*//p' "$admin_file" | head -n1)"
-    admin_pass="$(sed -n 's/^Password:[[:space:]]*//p' "$admin_file" | head -n1)"
-    file_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
-    file_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
-    [[ -n "$file_org" ]] && org="$file_org"
-    [[ -n "$file_bucket" ]] && bucket="$file_bucket"
-    if [[ -n "$admin_user" && -n "$admin_pass" ]]; then
-      influx setup \
-        --username "$admin_user" \
-        --password "$admin_pass" \
-        --org "$org" \
-        --bucket "$bucket" \
-        --retention "${INFLUX_RETENTION_HOURS}h" \
-        --token "$token" \
-        --force >/dev/null 2>&1 || true
-      if influx auth create \
-        --org "$org" \
-        --token "$token" \
-        --description "$desc" \
-        --read-bucket "$bucket" \
-        --write-bucket "$bucket" >/dev/null 2>&1; then
-        printf '%s' "$token"
-        return 0
-      fi
-    fi
-  fi
-
-  return 1
 }
 
 prompt_yes_no() {
