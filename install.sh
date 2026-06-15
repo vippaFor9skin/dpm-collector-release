@@ -912,7 +912,7 @@ prompt() {
   local default="${2:-}"
   local var
   if [[ -n "$default" ]]; then
-    read -rp "? $msg [$default]: " var
+    read -rp "? $msg （預設 ${default}）: " var
     echo "${var:-$default}"
   else
     read -rp "? $msg: " var
@@ -1004,7 +1004,6 @@ prompt_serial_port() {
 
   manual_idx=$((${#ports[@]} + 1))
 
-  echo "" >&2
   echo "請選擇 Modbus 序列埠（RS-485／USB 轉串口；滑鼠、鍵盤、網卡不在此列）：" >&2
   if [[ ${#ports[@]} -eq 0 ]]; then
     echo "  （目前未偵測到 /dev/ttyUSB* 或 /dev/ttyACM*）" >&2
@@ -1019,7 +1018,6 @@ prompt_serial_port() {
     done
   fi
   printf '  %d) 手動輸入路徑（預設 %s）\n' "$manual_idx" "$default_manual" >&2
-  echo "" >&2
 
   if [[ ${#ports[@]} -gt 0 ]]; then
     default_choice=1
@@ -1027,7 +1025,7 @@ prompt_serial_port() {
     default_choice="$manual_idx"
   fi
 
-  read -rp "? 請選擇 [${default_choice}]: " choice >&2
+  read -rp "? 請選擇 （預設 ${default_choice}）: " choice >&2
   choice="${choice:-$default_choice}"
 
   if [[ "$choice" == "$manual_idx" ]]; then
