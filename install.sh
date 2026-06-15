@@ -266,10 +266,100 @@ resolve_influx_credentials() {
   printf -v "$_var" '%s|%s|%s' "$influx_org" "$influx_bucket" "$influx_token"
 }
 
+influx_sudo_user() {
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    printf '%s' "$SUDO_USER"
+  fi
+}
+
+influx_invoke_as_user() {
+  local user="$1"
+  shift
+  if [[ -n "$user" ]]; then
+    sudo -u "$user" env INFLUX_HOST="$INFLUX_HOST" "$@"
+  else
+    env INFLUX_HOST="$INFLUX_HOST" "$@"
+  fi
+}
+
+influx_cli_user_can_list_orgs() {
+  local user="$1"
+  influx_invoke_as_user "$user" influx org list --hide-headers >/dev/null 2>&1
+}
+
 influx_token_can_list_orgs() {
   local token="$1"
   [[ -n "$token" ]] || return 1
   INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$token" influx org list --hide-headers >/dev/null 2>&1
+}
+
+extract_active_token_from_influx_config_json() {
+  node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const j=JSON.parse(s);
+    const list=Array.isArray(j)
+      ? j
+      : (j.configs
+        ? Object.entries(j.configs).map(([name, c]) => ({ name, ...c }))
+        : Object.entries(j).filter(([, c]) => c && typeof c === 'object').map(([name, c]) => ({ name, ...c })));
+    const active=list.find((c)=>c.active===true||c.active==='true')||list[0];
+    if(active&&active.token) process.stdout.write(String(active.token));
+  } catch {}
+});
+"
+}
+
+get_influx_cli_token_for_user() {
+  local user="$1" raw
+  raw="$(influx_invoke_as_user "$user" influx config list --json 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  trim_value "$(printf '%s' "$raw" | extract_active_token_from_influx_config_json)"
+}
+
+detect_influx_org_with_cli_user() {
+  local user="$1"
+  local preferred="$2"
+  local detected
+  detected="$(influx_invoke_as_user "$user" influx org list --hide-headers --json 2>/dev/null | node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const arr=JSON.parse(s);
+    const names=(Array.isArray(arr)?arr:[]).map((o)=>o.name).filter(Boolean);
+    const pref=process.argv[1];
+    if(names.includes(pref)){ process.stdout.write(pref); return; }
+    if(names[0]) process.stdout.write(names[0]);
+  } catch {}
+});
+" "$preferred" 2>/dev/null || true)"
+  detected="$(trim_value "$detected")"
+  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
+}
+
+detect_influx_bucket_with_cli_user() {
+  local user="$1"
+  local org="$2"
+  local preferred="$3"
+  local detected
+  detected="$(influx_invoke_as_user "$user" influx bucket list --org "$org" --hide-headers --json 2>/dev/null | node -e "
+let s='';
+process.stdin.on('data',(d)=>s+=d);
+process.stdin.on('end',()=>{
+  try {
+    const arr=JSON.parse(s);
+    const names=(Array.isArray(arr)?arr:[]).map((b)=>b.name).filter(Boolean);
+    const pref=process.argv[1];
+    if(names.includes(pref)){ process.stdout.write(pref); return; }
+    if(names[0]) process.stdout.write(names[0]);
+  } catch {}
+});
+" "$preferred" 2>/dev/null || true)"
+  detected="$(trim_value "$detected")"
+  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
 }
 
 collect_influx_tokens_from_configs_file() {
@@ -301,9 +391,13 @@ collect_influx_tokens_from_user() {
 }
 
 collect_all_influx_config_tokens() {
-  local raw token
+  local raw token sudo_user
+  sudo_user="$(influx_sudo_user || true)"
+
   raw="$(influx config list --json 2>/dev/null || true)"
   if [[ -n "$raw" ]]; then
+    token="$(printf '%s' "$raw" | extract_active_token_from_influx_config_json || true)"
+    [[ -n "$token" ]] && printf '%s\n' "$token"
     printf '%s' "$raw" | node -e "
 let s='';
 process.stdin.on('data',(d)=>s+=d);
@@ -316,13 +410,26 @@ process.stdin.on('end',()=>{
 });
 "
   fi
-  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    collect_influx_tokens_from_user "$SUDO_USER"
+
+  if [[ -n "$sudo_user" ]]; then
+    token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
+    [[ -n "$token" ]] && printf '%s\n' "$token"
+    collect_influx_tokens_from_user "$sudo_user"
   fi
 }
 
 find_influx_operator_token() {
-  local token
+  local token sudo_user
+  sudo_user="$(influx_sudo_user || true)"
+
+  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
+    token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
+    if [[ -n "$token" ]] && influx_token_can_list_orgs "$token"; then
+      printf '%s' "$token"
+      return 0
+    fi
+  fi
+
   while IFS= read -r token; do
     token="$(trim_value "$token")"
     [[ -n "$token" ]] || continue
@@ -470,10 +577,25 @@ influx_auth_create_token() {
   local token="$3"
   local desc="$4"
   local op_token="${5:-}"
-  local err_log rc
+  local err_log rc sudo_user
 
   err_log="$(mktemp)"
+  sudo_user="$(influx_sudo_user || true)"
   [[ -n "$op_token" ]] || op_token="$(find_influx_operator_token || true)"
+
+  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
+    if influx_invoke_as_user "$sudo_user" influx auth create \
+      --org "$org" \
+      --token "$token" \
+      --description "$desc" \
+      --read-bucket "$bucket" \
+      --write-bucket "$bucket" 2>"$err_log"; then
+      rm -f "$err_log"
+      return 0
+    fi
+    log "以 $sudo_user 建立 Token 失敗：$(tr '\n' ' ' < "$err_log" | head -c 200)"
+    : >"$err_log"
+  fi
 
   if [[ -n "$op_token" ]]; then
     if INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$op_token" influx auth create \
@@ -522,10 +644,29 @@ influx_setup_force_rebind() {
 create_collector_influx_token() {
   local org="$1"
   local bucket="$2"
-  local token desc admin_file op_token
+  local token desc admin_file op_token sudo_user
   admin_file="/root/dpm-collector-influx-admin.txt"
   token="$(openssl rand -hex 32)"
   desc="dpm-collector-$(date +%Y%m%d%H%M%S)"
+  sudo_user="$(influx_sudo_user || true)"
+
+  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
+    org="$(detect_influx_org_with_cli_user "$sudo_user" "$org")"
+    bucket="$(detect_influx_bucket_with_cli_user "$sudo_user" "$org" "$bucket")"
+    log "Influx 已存在：org=$org bucket=$bucket（自 $sudo_user 的 influx CLI 偵測）"
+    if influx_auth_create_token "$org" "$bucket" "$token" "$desc"; then
+      save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
+      printf '%s|%s|%s' "$org" "$bucket" "$token"
+      return 0
+    fi
+    op_token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
+    if [[ -n "$op_token" ]] && influx_token_can_list_orgs "$op_token"; then
+      log "⚠️  無法建立獨立 Token，沿用 $sudo_user 的 Influx CLI Token"
+      save_influx_admin_token "$admin_file" "$org" "$bucket" "$op_token"
+      printf '%s|%s|%s' "$org" "$bucket" "$op_token"
+      return 0
+    fi
+  fi
 
   op_token="$(find_influx_operator_token || true)"
   if [[ -n "$op_token" ]]; then
@@ -674,7 +815,7 @@ EOF
       log "InfluxDB 伺服器已初始化，改為建立採集程式 API Token …"
       created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
       resolve_influx_credentials creds "$created" || \
-        die "無法建立 InfluxDB Token。請在本機執行 influx org list 確認已登入，或刪除舊 Influx 資料後重裝"
+        die "無法建立 InfluxDB Token。請確認 sudo 執行者（${SUDO_USER:-root}）曾 influx setup，或執行：sudo -u ${SUDO_USER:-$USER} influx org list"
       IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
     fi
   elif [[ -f "$INSTALL_DIR/.env" ]]; then
