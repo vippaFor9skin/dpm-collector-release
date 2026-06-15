@@ -1444,8 +1444,8 @@ start_service() {
       log "版本：$(head -n1 "$INSTALL_DIR/VERSION")"
     fi
   else
-    echo "--- journalctl -u ${SERVICE_NAME} -n 30 --no-pager ---" >&2
-    journalctl -u "$SERVICE_NAME" -n 30 --no-pager >&2 || true
+    echo "--- 最近 30 行日誌 ---" >&2
+    journalctl -u "$SERVICE_NAME" -o cat -n 30 --no-pager >&2 || true
     die "服務啟動失敗（常見：MODBUS_SLAVE_IDS 與 device-identities 不符、序列埠不存在、MQTT 設定缺漏）"
   fi
 }

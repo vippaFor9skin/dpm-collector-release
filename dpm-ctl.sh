@@ -11,7 +11,7 @@ usage() {
   cat <<EOF
 用法: $(basename "$0") <command>
 
-  status          檢查 systemd 狀態 + journal 最近 20 行
+  status          檢查 systemd 狀態 + 最近 20 行日誌
   logs [-n N]     即時查看日誌（預設 -n 100）
   restart         重啟服務
   start           啟動服務
@@ -30,10 +30,15 @@ require_install_dir() {
   [[ -d "$INSTALL_DIR" ]] || die "找不到安裝目錄 $INSTALL_DIR"
 }
 
+# 僅顯示程式輸出，不帶 journal 的「Jun 15 … dpm-collector[pid]:」前綴
+journal_app_logs() {
+  journalctl -u "$SERVICE_NAME" -o cat "$@"
+}
+
 cmd_status() {
   systemctl status "$SERVICE_NAME" --no-pager || true
-  echo "--- 最近 20 行 journal ---"
-  journalctl -u "$SERVICE_NAME" -n 20 --no-pager
+  echo "--- 最近 20 行日誌 ---"
+  journal_app_logs -n 20 --no-pager
 }
 
 cmd_logs() {
@@ -42,7 +47,7 @@ cmd_logs() {
     lines="$2"
     shift 2
   fi
-  journalctl -u "$SERVICE_NAME" -f -n "$lines"
+  journal_app_logs -f -n "$lines"
 }
 
 ensure_git_safe_directory() {
