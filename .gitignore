@@ -1,0 +1,21 @@
+# 客戶公開倉庫 dpm-collector-release 用 .gitignore
+# 由 sync-to-client-repo.sh 同步；請勿手動移除
+
+# 本機依賴（git pull 後由 install.sh / npm ci 產生，不入版控）
+node_modules/
+
+# 執行期設定與資料
+.env
+data/
+*.log
+
+# 設備身分對照（現場自訂，不入版控）
+config/device-identities.json
+
+# 開發端產物／不應出現在此倉庫
+src/
+scripts/
+docs/
+usb-pack/
+release/
+.vscode/
