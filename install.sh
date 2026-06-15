@@ -1470,6 +1470,9 @@ finish_install_success() {
   echo
   log_highlight "接下來顯示即時日誌，可按 Ctrl+C 離開（不影響服務運行）"
   countdown_progress_bar 5
+  if [[ -t 1 ]]; then
+    clear
+  fi
   "$INSTALL_DIR/dpm-ctl.sh" logs -n 30 || true
   "$INSTALL_DIR/dpm-ctl.sh" status || true
 }
