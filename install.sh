@@ -31,6 +31,36 @@ fi
 log() { echo "[install] $*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
+log_highlight() {
+  if [[ -t 2 ]]; then
+    printf '\033[33m%s\033[0m\n' "$*" >&2
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+countdown_progress_bar() {
+  local total="${1:-5}"
+  local width=40
+  local i j n
+  if [[ ! -t 2 ]]; then
+    sleep "$total"
+    return
+  fi
+  for ((i=1; i<=total; i++)); do
+    n=$((i * width / total))
+    if [[ -t 2 ]]; then
+      printf '\r\033[33m[' >&2
+      for ((j=0; j<width; j++)); do
+        if ((j < n)); then printf '█' >&2; else printf '░' >&2; fi
+      done
+      printf '] %d/%ds\033[0m' "$i" "$total" >&2
+    fi
+    sleep 1
+  done
+  echo >&2
+}
+
 resolve_path() {
   readlink -f "$1" 2>/dev/null || realpath "$1"
 }
@@ -1432,9 +1462,9 @@ finish_install_success() {
     echo "   查看日誌：$INSTALL_DIR/dpm-ctl.sh logs"
   fi
   echo
-  log "接下來顯示即時日誌，可按 Ctrl+C 離開（不影響服務運行）"
+  log_highlight "接下來顯示即時日誌，可按 Ctrl+C 離開（不影響服務運行）"
+  countdown_progress_bar 5
   "$INSTALL_DIR/dpm-ctl.sh" logs -n 30 || true
-  sleep 5
   "$INSTALL_DIR/dpm-ctl.sh" status || true
 }
 
