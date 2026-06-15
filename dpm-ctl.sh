@@ -45,9 +45,27 @@ cmd_logs() {
   journalctl -u "$SERVICE_NAME" -f -n "$lines"
 }
 
+ensure_git_safe_directory() {
+  local dir
+  dir="$(readlink -f "$INSTALL_DIR" 2>/dev/null || realpath "$INSTALL_DIR")"
+  [[ -d "$dir/.git" ]] || return 0
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+  if git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$dir"; then
+    return 0
+  fi
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    git config --global --add safe.directory "$dir"
+  else
+    sudo git config --global --add safe.directory "$dir"
+  fi
+}
+
 cmd_update() {
   require_install_dir
   if [[ -d "$INSTALL_DIR/.git" ]]; then
+    ensure_git_safe_directory
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
       git -C "$INSTALL_DIR" pull
     else
