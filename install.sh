@@ -299,11 +299,21 @@ EOF
 sync_app_files() {
   local dest="$1"
   log "同步程式檔案到 $dest …"
-  mkdir -p "$dest/dist" "$dest/config" "$dest/data"
+  mkdir -p "$dest/dist" "$dest/config" "$dest/data" "$dest/lib"
   cp -f "$SOURCE_DIR/dist/index.js" "$dest/dist/index.js"
   [[ -f "$SOURCE_DIR/dist/VERSION" ]] && cp -f "$SOURCE_DIR/dist/VERSION" "$dest/dist/VERSION"
-  cp -f "$SOURCE_DIR/package.json" "$dest/package.json"
-  cp -f "$SOURCE_DIR/package-lock.json" "$dest/package-lock.json"
+  if [[ -f "$SOURCE_DIR/lib/package.json" ]]; then
+    cp -f "$SOURCE_DIR/lib/package.json" "$dest/lib/package.json"
+    cp -f "$SOURCE_DIR/lib/package-lock.json" "$dest/lib/package-lock.json"
+    [[ -f "$SOURCE_DIR/lib/dpm-collector.service" ]] && \
+      cp -f "$SOURCE_DIR/lib/dpm-collector.service" "$dest/lib/dpm-collector.service"
+  elif [[ -f "$SOURCE_DIR/package.json" ]]; then
+    # 相容舊版客戶 repo 根目錄 layout
+    cp -f "$SOURCE_DIR/package.json" "$dest/lib/package.json"
+    cp -f "$SOURCE_DIR/package-lock.json" "$dest/lib/package-lock.json"
+    [[ -f "$SOURCE_DIR/dpm-collector.service" ]] && \
+      cp -f "$SOURCE_DIR/dpm-collector.service" "$dest/lib/dpm-collector.service"
+  fi
   [[ -f "$SOURCE_DIR/.env.example" ]] && cp -f "$SOURCE_DIR/.env.example" "$dest/.env.example"
   if [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
     cp -f "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
@@ -370,9 +380,13 @@ install_dependencies() {
     cp -a "$SOURCE_DIR/node_modules" "$dest/node_modules"
     return
   fi
-  log "執行 npm ci --omit=dev …"
-  cd "$dest"
-  npm ci --omit=dev
+  if [[ ! -f "$dest/lib/package.json" ]]; then
+    die "找不到 $dest/lib/package.json（請確認為新版客戶 repo 或重新 release:client）"
+  fi
+  log "執行 npm ci --omit=dev（lib/）…"
+  (cd "$dest/lib" && npm ci --omit=dev)
+  rm -rf "$dest/node_modules"
+  mv "$dest/lib/node_modules" "$dest/node_modules"
 }
 
 ensure_service_user() {
@@ -386,9 +400,10 @@ ensure_service_user() {
 }
 
 install_systemd_unit() {
-  local unit_src="$SOURCE_DIR/scripts/dpm-collector.service"
+  local unit_src="$SOURCE_DIR/lib/dpm-collector.service"
   [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/dpm-collector.service"
-  [[ -f "$unit_src" ]] || die "找不到 dpm-collector.service"
+  [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/scripts/dpm-collector.service"
+  [[ -f "$unit_src" ]] || die "找不到 dpm-collector.service（lib/ 或舊版根目錄）"
 
   sed "s|/opt/dpm-collector|$INSTALL_DIR|g" "$unit_src" \
     > "/etc/systemd/system/${SERVICE_NAME}.service"

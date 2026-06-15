@@ -1,8 +1,9 @@
 # 客戶公開倉庫 dpm-collector-release 用 .gitignore
 # 由 sync-to-client-repo.sh 同步；請勿手動移除
 
-# 本機依賴（git pull 後由 install.sh / npm ci 產生，不入版控）
+# 本機依賴（install.sh 產生於根目錄 node_modules/，不入版控）
 node_modules/
+lib/node_modules/
 
 # 執行期設定與資料
 .env

@@ -23,7 +23,7 @@ cd /opt/dpm-collector
 sudo ./install.sh
 ```
 
-> 倉庫內僅含 `dist/`、安裝腳本與 `package.json`；`node_modules` 由 `install.sh` 執行 `npm ci` 產生，不在 Git 內。
+> 倉庫以 **`dist/`** 為主；`node_modules` 由 `install.sh` 自動安裝，不在 Git 內。`lib/` 為內部檔，無需手動修改。
 
 安裝腳本會：
 
