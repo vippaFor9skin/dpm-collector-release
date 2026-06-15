@@ -886,6 +886,18 @@ trim_value() {
   printf '%s' "$v"
 }
 
+format_dotenv_value() {
+  local v="$1"
+  [[ -n "$v" ]] || return 0
+  if [[ "$v" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+    printf '%s' "$v"
+    return
+  fi
+  local escaped="${v//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  printf '"%s"' "$escaped"
+}
+
 prompt_yes_no() {
   local msg="$1"
   local default="${2:-Y}"
@@ -1007,8 +1019,13 @@ write_env_file() {
 
   serial_port="$(prompt_serial_port)"
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
+  slave_ids="${slave_ids//[\[\]]/}"
 
-  log "MQTT / 輪詢使用預設：MQTT_URL=$mqtt_url MONITOR_ONLY=$monitor_only POLL_INTERVAL_MS=$poll_ms"
+  log "MQTT 預設：MQTT_URL=$mqtt_url MQTT_USERNAME=$mqtt_user MONITOR_ONLY=$monitor_only POLL_INTERVAL_MS=$poll_ms"
+  mqtt_pass="$(prompt_secret "請輸入 MQTT_PASSWORD（Broker 密碼；直接 Enter 表示空密碼）")"
+  if [[ -z "$mqtt_pass" && -z "${DEFAULT_MQTT_PASSWORD:-}" ]]; then
+    log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
+  fi
 
   log "安裝 InfluxDB 2（必填：本地 7 天緩存，斷網時仍保存採樣）…"
   setup_result="$(ensure_influxdb_for_install)"
@@ -1048,7 +1065,7 @@ MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
 GATEWAY_ID=$gateway_id
 MQTT_CLIENT_ID=
 MQTT_USERNAME=$mqtt_user
-MQTT_PASSWORD=$mqtt_pass
+MQTT_PASSWORD=$(format_dotenv_value "$mqtt_pass")
 MQTT_QOS=1
 MQTT_CONNECT_TIMEOUT_MS=30000
 MQTT_TLS_INSECURE=0
