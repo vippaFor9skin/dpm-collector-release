@@ -880,6 +880,20 @@ sync_app_files() {
   fi
 }
 
+ensure_git_safe_directory() {
+  local dir
+  dir="$(readlink -f "$1" 2>/dev/null || realpath "$1")"
+  [[ -d "$dir/.git" ]] || return 0
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+  if git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$dir"; then
+    return 0
+  fi
+  git config --global --add safe.directory "$dir"
+  log "已將 $dir 加入 git safe.directory（sudo 與 clone 擁有者不同時才可 pull）"
+}
+
 link_git_from_source() {
   local dest="$1"
   if [[ -d "$SOURCE_DIR/.git" ]] && [[ ! -d "$dest/.git" ]]; then
@@ -903,6 +917,7 @@ link_git_from_source() {
   fi
 
   if [[ -d "$dest/.git" ]]; then
+    ensure_git_safe_directory "$dest"
     local remote_url=""
     if [[ -n "$manifest" ]]; then
       remote_url="$(node -e "

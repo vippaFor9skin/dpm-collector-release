@@ -102,10 +102,13 @@ sudo /opt/dpm-collector/dpm-ctl.sh update
 或手動：
 
 ```bash
-cd /opt/dpm-collector   # 若為 git clone 目錄
-git pull
-sudo ./install.sh       # 更新模式：只更新 dist 並重啟
+cd /opt/dpm-collector
+sudo git config --global --add safe.directory /opt/dpm-collector   # 僅首次若 sudo git pull 報 dubious ownership
+sudo git pull
+sudo ./install.sh       # 更新模式
 ```
+
+> **說明**：若以 `sudo git clone` 安裝，目錄屬於 root；`git pull` 必須用 **sudo**，且 `safe.directory` 要加在 **root** 的設定（`sudo git config ...`），不能只加在一般使用者。`install.sh` / `dpm-ctl.sh update` 會自動處理。
 
 ---
 
