@@ -138,7 +138,22 @@ install_influxdb_apt() {
 INFLUX_HOST="${INFLUX_HOST:-http://127.0.0.1:8086}"
 
 influx_cli() {
-  influx --host "$INFLUX_HOST" "$@"
+  INFLUX_HOST="$INFLUX_HOST" influx "$@"
+}
+
+influx_http_healthy() {
+  ensure_influx_http_client
+  local body=""
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -sf "${INFLUX_HOST}/health" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    body="$(wget -qO- "${INFLUX_HOST}/health" 2>/dev/null || true)"
+  fi
+  [[ -n "$body" ]] && echo "$body" | grep -qE '"status"[[:space:]]*:[[:space:]]*"pass"'
+}
+
+influx_reachable() {
+  influx_http_healthy || influx_cli ping >/dev/null 2>&1
 }
 
 influx_is_initialized() {
@@ -173,7 +188,7 @@ influx_server_needs_setup() {
     return 1
   fi
   # Influx 已在跑但讀不到 setup API：視為已初始化，不要 rerun setup
-  if influx_cli ping >/dev/null 2>&1; then
+  if influx_reachable; then
     log "InfluxDB 已在運行，略過 setup（改為建立 API Token）"
     return 1
   fi
@@ -183,7 +198,7 @@ influx_server_needs_setup() {
 wait_for_influx_ping() {
   local i
   for i in $(seq 1 20); do
-    if influx_cli ping >/dev/null 2>&1; then
+    if influx_reachable; then
       return 0
     fi
     sleep 1
@@ -311,7 +326,7 @@ influx_auth_create_token() {
   op_token="$(get_active_influx_token)"
 
   if [[ -n "$op_token" ]]; then
-    if INFLUX_TOKEN="$op_token" influx_cli auth create \
+    if INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$op_token" influx auth create \
       --org "$org" \
       --token "$token" \
       --description "$desc" \
@@ -488,7 +503,7 @@ EOF
       log "InfluxDB 伺服器已初始化，改為建立採集程式 API Token …"
       created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
       resolve_influx_credentials creds "$created" || \
-        die "無法建立 InfluxDB Token。請查看 $admin_file 或執行：sudo influx --host ${INFLUX_HOST} org list"
+        die "無法建立 InfluxDB Token。請查看 $admin_file 或執行：sudo INFLUX_HOST=${INFLUX_HOST} influx org list"
       IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
     fi
   elif [[ -f "$INSTALL_DIR/.env" ]]; then
@@ -506,7 +521,7 @@ EOF
     local created creds
     created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
     resolve_influx_credentials creds "$created" || \
-      die "無法建立 InfluxDB Token。請查看 $admin_file 或執行：sudo influx --host ${INFLUX_HOST} auth list"
+      die "無法建立 InfluxDB Token。請查看 $admin_file 或執行：sudo INFLUX_HOST=${INFLUX_HOST} influx auth list"
     IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
   fi
 
@@ -522,8 +537,8 @@ verify_influxdb_ready() {
   if ! systemctl is-active --quiet influxdb 2>/dev/null; then
     die "InfluxDB 服務未運行（本地緩存必填）"
   fi
-  if ! influx_cli ping >/dev/null 2>&1; then
-    die "InfluxDB 無法 ping；請檢查 systemctl status influxdb"
+  if ! influx_reachable; then
+    die "InfluxDB 無法連線；請檢查 systemctl status influxdb 與 curl ${INFLUX_HOST}/health"
   fi
 }
 

@@ -129,7 +129,7 @@ cmd_test_influx() {
   if ! command -v influx >/dev/null 2>&1; then
     die "找不到 influx CLI"
   fi
-  influx ping || die "influx ping 失敗"
+  influx ping || die "influx ping 失敗（可試：INFLUX_HOST=http://127.0.0.1:8086 influx ping）"
   cd "$INSTALL_DIR"
   node -e "
 require('dotenv').config({ path: '.env' });
