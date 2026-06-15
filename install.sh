@@ -809,11 +809,10 @@ log_influx_credentials() {
   local org="$1"
   local bucket="$2"
   local token="$3"
-  log "InfluxDB 設定："
-  log "  INFLUX_URL=${INFLUX_HOST}"
-  log "  INFLUX_ORG=$org"
-  log "  INFLUX_BUCKET=$bucket"
-  log "  INFLUX_TOKEN=$token"
+  log "INFLUX_URL=${INFLUX_HOST}"
+  log "INFLUX_ORG=$org"
+  log "INFLUX_BUCKET=$bucket"
+  log "INFLUX_TOKEN=$token"
 }
 
 log_mqtt_defaults() {
