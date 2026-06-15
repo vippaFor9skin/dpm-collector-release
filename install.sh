@@ -145,15 +145,39 @@ influx_is_initialized() {
   influx_cli ping >/dev/null 2>&1 && influx_cli org list >/dev/null 2>&1
 }
 
-influx_server_needs_setup() {
-  local body
-  body="$(curl -sf "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
-  if [[ -n "$body" ]]; then
-    echo "$body" | grep -qE '"allowed"[[:space:]]*:[[:space:]]*true'
-    return
+fetch_influx_setup_status() {
+  local body=""
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -sf "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    body="$(wget -qO- "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
   fi
-  # curl 不可用時：CLI 無法 list org 視為尚未 setup
-  ! influx_is_initialized
+  printf '%s' "$body"
+}
+
+ensure_influx_http_client() {
+  command -v curl >/dev/null 2>&1 && return 0
+  command -v wget >/dev/null 2>&1 && return 0
+  apt-get update -qq
+  apt-get install -y curl
+}
+
+influx_server_needs_setup() {
+  ensure_influx_http_client
+  local body
+  body="$(fetch_influx_setup_status)"
+  if [[ -n "$body" ]]; then
+    if echo "$body" | grep -qE '"allowed"[[:space:]]*:[[:space:]]*true'; then
+      return 0
+    fi
+    return 1
+  fi
+  # Influx 已在跑但讀不到 setup API：視為已初始化，不要 rerun setup
+  if influx_cli ping >/dev/null 2>&1; then
+    log "InfluxDB 已在運行，略過 setup（改為建立 API Token）"
+    return 1
+  fi
+  return 0
 }
 
 wait_for_influx_ping() {
@@ -409,6 +433,10 @@ configure_influxdb_localhost() {
   local cfg
   for cfg in /etc/influxdb2/config.toml /etc/influxdb/config.toml; do
     [[ -f "$cfg" ]] || continue
+    if grep -qE '^[[:space:]]*http-bind-address[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8086"' "$cfg"; then
+      log "InfluxDB 已綁定 127.0.0.1:8086"
+      return 0
+    fi
     if grep -qE '^[[:space:]]*#?[[:space:]]*http-bind-address' "$cfg"; then
       sed -i -E 's|^[[:space:]]*#?[[:space:]]*http-bind-address.*|http-bind-address = "127.0.0.1:8086"|' "$cfg"
     else
