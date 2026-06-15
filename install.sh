@@ -8,6 +8,11 @@ SERVICE_USER="${SERVICE_USER:-dpm}"
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
 INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
 CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
+DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://localhost:1883}"
+DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-}"
+DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
+DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-5000}"
+DEFAULT_MONITOR_ONLY="${DEFAULT_MONITOR_ONLY:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/index.js" ]]; then
@@ -492,23 +497,21 @@ write_env_file() {
   local env_file="$1"
   log "建立 $env_file …"
 
-  local gateway_id mqtt_url mqtt_user mqtt_pass serial_port slave_ids poll_ms monitor_only
+  local gateway_id serial_port slave_ids
   local influx_org influx_bucket influx_token setup_result
+  local mqtt_url="$DEFAULT_MQTT_URL"
+  local mqtt_user="$DEFAULT_MQTT_USERNAME"
+  local mqtt_pass="$DEFAULT_MQTT_PASSWORD"
+  local poll_ms="$DEFAULT_POLL_INTERVAL_MS"
+  local monitor_only="$DEFAULT_MONITOR_ONLY"
 
   gateway_id="$(prompt "請輸入 GATEWAY_ID（後台 Gateway 主檔的識別碼）")"
   [[ -n "$gateway_id" ]] || die "GATEWAY_ID 不可為空"
 
-  mqtt_url="$(prompt "請輸入 MQTT Broker 網址" "mqtt://localhost:1883")"
-  mqtt_user="$(prompt "MQTT 使用者名稱（可留空）" "")"
-  mqtt_pass="$(trim_value "$(prompt_secret "MQTT 密碼（可留空）")")"
   serial_port="$(prompt "請輸入序列埠" "/dev/ttyUSB0")"
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
-  poll_ms="$(prompt "輪詢間隔毫秒" "5000")"
-  if prompt_yes_no "MONITOR_ONLY 模式（僅監看、不送 MQTT）？" "n"; then
-    monitor_only="1"
-  else
-    monitor_only="0"
-  fi
+
+  log "MQTT / 輪詢使用預設：MQTT_URL=$mqtt_url MONITOR_ONLY=$monitor_only POLL_INTERVAL_MS=$poll_ms"
 
   log "安裝 InfluxDB 2（必填：本地 7 天緩存，斷網時仍保存採樣）…"
   setup_result="$(ensure_influxdb_for_install)"
