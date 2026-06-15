@@ -66,7 +66,9 @@ cmd_update() {
   require_install_dir
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     ensure_git_safe_directory
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    if [[ -w "$INSTALL_DIR" ]] && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      git -C "$INSTALL_DIR" pull
+    elif [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
       git -C "$INSTALL_DIR" pull
     else
       sudo git -C "$INSTALL_DIR" pull

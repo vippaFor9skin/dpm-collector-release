@@ -1299,14 +1299,31 @@ install_systemd_unit() {
 }
 
 fix_permissions() {
-  chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-  chmod 750 "$INSTALL_DIR"
-  chmod 750 "$INSTALL_DIR/data"
-  [[ -f "$INSTALL_DIR/.env" ]] && chmod 600 "$INSTALL_DIR/.env"
+  local install_owner="${SUDO_USER:-root}"
+  local data_dir="$INSTALL_DIR/data"
+
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     usermod -aG "$SERVICE_USER" "$SUDO_USER" 2>/dev/null || true
-    log "已將 $SUDO_USER 加入 $SERVICE_USER 群組（請重新登入 SSH 後可直接存取 $INSTALL_DIR）"
   fi
+
+  mkdir -p "$data_dir"
+
+  # 安裝者持有檔案、dpm 群組可讀 → 工程師可 git pull／編輯 config，服務仍可讀取
+  chown -R "$install_owner:$SERVICE_USER" "$INSTALL_DIR"
+  chown "$SERVICE_USER:$SERVICE_USER" "$data_dir"
+
+  find "$INSTALL_DIR" -type d ! -path "$data_dir" -exec chmod 2775 {} \;
+  chmod 2775 "$data_dir"
+  find "$INSTALL_DIR" -type f ! -path "$data_dir/*" -exec chmod 664 {} \;
+  find "$data_dir" -type f -exec chmod 660 {} \; 2>/dev/null || true
+
+  chmod 775 "$INSTALL_DIR/dpm-ctl.sh" "$INSTALL_DIR/install.sh" 2>/dev/null || true
+  [[ -f "$INSTALL_DIR/.env" ]] && chmod 640 "$INSTALL_DIR/.env"
+
+  # 根目錄允許 ls / cd；寫入仍限擁有者（與群組成員）
+  chmod 755 "$INSTALL_DIR"
+
+  log "目錄權限：${install_owner} 可編輯與 git pull；服務帳號 ${SERVICE_USER} 經群組讀取設定"
 }
 
 is_update_mode() {
