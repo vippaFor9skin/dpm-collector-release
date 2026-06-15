@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# DPM-DA510/530 Modbus RTU Collector — one-click install / update for BL118 (Ubuntu 20.04+)
+set -euo pipefail
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/dpm-collector}"
+SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
+SERVICE_USER="${SERVICE_USER:-dpm}"
+NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
+INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/dist/index.js" ]]; then
+  SOURCE_DIR="$SCRIPT_DIR"
+elif [[ -f "$SCRIPT_DIR/../dist/index.js" ]]; then
+  SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  echo "❌ 找不到 dist/index.js，請在解壓或 clone 後的套件根目錄執行 install.sh"
+  exit 1
+fi
+
+log() { echo "[install] $*" >&2; }
+die() { echo "❌ $*" >&2; exit 1; }
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "請以 root 執行：sudo $0"
+  fi
+}
+
+detect_system() {
+  log "系統：$(uname -s) $(uname -m)"
+  if [[ -r /proc/meminfo ]]; then
+    local mem_kb
+    mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+    log "記憶體：$(( mem_kb / 1024 )) MB"
+  fi
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    log "發行版：${PRETTY_NAME:-unknown}"
+  fi
+}
+
+node_major() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo 0
+    return
+  fi
+  node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1
+}
+
+install_nodejs() {
+  log "安裝 Node.js ${NODE_MIN_MAJOR}+ …"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y ca-certificates curl gnupg
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x" | bash -
+    apt-get install -y nodejs
+  else
+    die "不支援的套件管理器，請手動安裝 Node.js ${NODE_MIN_MAJOR}+"
+  fi
+  log "Node.js 版本：$(node -v)"
+}
+
+ensure_nodejs() {
+  local major
+  major="$(node_major)"
+  if [[ "$major" -lt "$NODE_MIN_MAJOR" ]]; then
+    install_nodejs
+  else
+    log "Node.js 已安裝：$(node -v)"
+  fi
+}
+
+install_influxdb_apt() {
+  log "安裝 InfluxDB 2（apt）…"
+  apt-get update -qq
+  apt-get install -y wget gpg ca-certificates
+  local key_file
+  key_file="$(mktemp)"
+  wget -qO "$key_file" https://repos.influxdata.com/influxdata-archive.key
+  gpg --show-keys --with-fingerprint --with-colons "$key_file" 2>&1 \
+    | grep -qE ':24C975CBA61A024EE1B631787C3D57159FC2F927:' \
+    || die "InfluxData GPG 指紋驗證失敗"
+  gpg --dearmor < "$key_file" > /etc/apt/trusted.gpg.d/influxdata-archive.gpg
+  rm -f "$key_file"
+  echo "deb [signed-by=/etc/apt/trusted.gpg.d/influxdata-archive.gpg] https://repos.influxdata.com/debian stable main" \
+    > /etc/apt/sources.list.d/influxdata.list
+  apt-get update -qq
+  apt-get install -y influxdb2
+  systemctl enable --now influxdb
+  log "InfluxDB 服務已啟動"
+}
+
+influx_is_initialized() {
+  influx ping >/dev/null 2>&1 && influx org list >/dev/null 2>&1
+}
+
+init_influxdb() {
+  local username="${1:-dpmadmin}"
+  local password="${2:-}"
+  local org="${3:-nineskin}"
+  local bucket="${4:-9998-6_dpm}"
+  local token
+  token="$(openssl rand -hex 32)"
+
+  log "初始化 InfluxDB（org=$org, bucket=$bucket, retention=${INFLUX_RETENTION_HOURS}h）…"
+  influx setup \
+    --username "$username" \
+    --password "$password" \
+    --org "$org" \
+    --bucket "$bucket" \
+    --retention "${INFLUX_RETENTION_HOURS}h" \
+    --token "$token" \
+    --force
+
+  echo "$org|$bucket|$token"
+}
+
+configure_influxdb_localhost() {
+  local cfg
+  for cfg in /etc/influxdb2/config.toml /etc/influxdb/config.toml; do
+    [[ -f "$cfg" ]] || continue
+    if grep -qE '^[[:space:]]*#?[[:space:]]*http-bind-address' "$cfg"; then
+      sed -i -E 's|^[[:space:]]*#?[[:space:]]*http-bind-address.*|http-bind-address = "127.0.0.1:8086"|' "$cfg"
+    else
+      printf '\nhttp-bind-address = "127.0.0.1:8086"\n' >> "$cfg"
+    fi
+    systemctl restart influxdb
+    sleep 2
+    log "InfluxDB 僅監聽本機 127.0.0.1:8086"
+    return 0
+  done
+  log "⚠️  未找到 InfluxDB config.toml，請確認僅本機可連"
+}
+
+# 回傳 org|bucket|token（InfluxDB 為必填，供本地 7 天緩存）
+ensure_influxdb_for_install() {
+  local influx_org="${INFLUX_ORG:-nineskin}"
+  local influx_bucket="${INFLUX_BUCKET:-9998-6_dpm}"
+  local influx_token=""
+  local admin_file="/root/dpm-collector-influx-admin.txt"
+
+  log "InfluxDB 2 為必填（本地 7 天緩存 + 斷網期間資料安全）…"
+
+  if ! dpkg -l influxdb2 >/dev/null 2>&1; then
+    install_influxdb_apt
+  elif ! systemctl is-active --quiet influxdb 2>/dev/null; then
+    systemctl enable --now influxdb || install_influxdb_apt
+  fi
+
+  configure_influxdb_localhost
+
+  if ! influx_is_initialized; then
+    local influx_pass
+    influx_pass="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
+    local setup_result
+    setup_result="$(init_influxdb "dpmadmin" "$influx_pass" "$influx_org" "$influx_bucket")"
+    IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
+    cat > "$admin_file" <<EOF
+InfluxDB 管理帳號（請妥善保存，勿提交 git）
+Username: dpmadmin
+Password: $influx_pass
+Org: $influx_org
+Bucket: $influx_bucket
+Retention: ${INFLUX_RETENTION_HOURS}h
+EOF
+    chmod 600 "$admin_file"
+    log "InfluxDB 管理帳號已寫入 $admin_file"
+  elif [[ -f "$INSTALL_DIR/.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$INSTALL_DIR/.env"
+    influx_org="${INFLUX_ORG:-$influx_org}"
+    influx_bucket="${INFLUX_BUCKET:-$influx_bucket}"
+    influx_token="${INFLUX_TOKEN:-}"
+    if [[ -z "$influx_token" ]]; then
+      die "InfluxDB 已初始化但 .env 缺少 INFLUX_TOKEN，請手動填入或重建 token"
+    fi
+    log "沿用既有 InfluxDB 設定"
+  else
+    log "InfluxDB 已初始化，請提供採集程式用 API Token"
+    influx_org="$(prompt "InfluxDB Organization" "$influx_org")"
+    influx_bucket="$(prompt "InfluxDB Bucket" "$influx_bucket")"
+    influx_token="$(prompt_secret "InfluxDB API Token（需可寫入 bucket）")"
+    [[ -n "$influx_token" ]] || die "INFLUX_TOKEN 不可為空"
+  fi
+
+  if ! influx ping >/dev/null 2>&1; then
+    die "InfluxDB 無法連線（http://127.0.0.1:8086）"
+  fi
+
+  echo "$influx_org|$influx_bucket|$influx_token"
+}
+
+verify_influxdb_ready() {
+  if ! systemctl is-active --quiet influxdb 2>/dev/null; then
+    die "InfluxDB 服務未運行（本地緩存必填）"
+  fi
+  if ! influx ping >/dev/null 2>&1; then
+    die "InfluxDB 無法 ping；請檢查 systemctl status influxdb"
+  fi
+}
+
+prompt() {
+  local msg="$1"
+  local default="${2:-}"
+  local var
+  if [[ -n "$default" ]]; then
+    read -rp "? $msg [$default]: " var
+    echo "${var:-$default}"
+  else
+    read -rp "? $msg: " var
+    echo "$var"
+  fi
+}
+
+prompt_secret() {
+  local msg="$1"
+  local var=""
+  read -rsp "? $msg: " var
+  echo
+  echo "$var"
+}
+
+prompt_yes_no() {
+  local msg="$1"
+  local default="${2:-Y}"
+  local hint="Y/n"
+  [[ "$default" == "n" || "$default" == "N" ]] && hint="y/N"
+  local ans
+  read -rp "? $msg ($hint): " ans
+  ans="${ans:-$default}"
+  [[ "$ans" =~ ^[Yy] ]]
+}
+
+write_env_file() {
+  local env_file="$1"
+  log "建立 $env_file …"
+
+  local gateway_id mqtt_url mqtt_user mqtt_pass serial_port slave_ids poll_ms monitor_only
+  local influx_org influx_bucket influx_token setup_result
+
+  gateway_id="$(prompt "請輸入 GATEWAY_ID（後台 Gateway 主檔的識別碼）")"
+  [[ -n "$gateway_id" ]] || die "GATEWAY_ID 不可為空"
+
+  mqtt_url="$(prompt "請輸入 MQTT Broker 網址" "mqtt://localhost:1883")"
+  mqtt_user="$(prompt "MQTT 使用者名稱（可留空）" "")"
+  mqtt_pass="$(prompt_secret "MQTT 密碼（可留空）")"
+  serial_port="$(prompt "請輸入序列埠" "/dev/ttyUSB0")"
+  slave_ids="$(prompt "Modbus Slave IDs（逗號分隔）" "1,2,3,4,5,6,7,8,9,10")"
+  poll_ms="$(prompt "輪詢間隔毫秒" "5000")"
+  if prompt_yes_no "MONITOR_ONLY 模式（僅監看、不送 MQTT）？" "n"; then
+    monitor_only="1"
+  else
+    monitor_only="0"
+  fi
+
+  log "安裝 InfluxDB 2（必填：本地 7 天緩存，斷網時仍保存採樣）…"
+  setup_result="$(ensure_influxdb_for_install)"
+  IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
+
+  cat > "$env_file" <<EOF
+# Generated by install.sh on $(date -Iseconds)
+SERIAL_PORT=$serial_port
+MODBUS_BAUD_RATE=9600
+MODBUS_DATA_BITS=8
+MODBUS_STOP_BITS=2
+MODBUS_PARITY=none
+MODBUS_SLAVE_IDS=$slave_ids
+MODBUS_TIMEOUT_MS=1000
+TIMEZONE=Asia/Taipei
+MONITOR_ONLY=$monitor_only
+MODBUS_FLOAT_SWAP_WORDS=0
+DEVICE_IDENTITIES_FILE=config/device-identities.json
+POLL_INTERVAL_MS=$poll_ms
+SQLITE_OUTBOX_PATH=data/dpm.db
+OUTBOX_FLUSH_BATCH=200
+INFLUX_URL=http://127.0.0.1:8086
+INFLUX_TOKEN=$influx_token
+INFLUX_ORG=$influx_org
+INFLUX_BUCKET=$influx_bucket
+INFLUX_MEASUREMENT=dpm
+INFLUX_WRITE_TIMEOUT_MS=20000
+INFLUX_SOURCE_TAG=dpm
+MQTT_URL=$mqtt_url
+MQTT_DATA_TOPIC=gw/data/{gatewayId}
+MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
+GATEWAY_ID=$gateway_id
+MQTT_CLIENT_ID=
+MQTT_USERNAME=$mqtt_user
+MQTT_PASSWORD=$mqtt_pass
+MQTT_QOS=1
+MQTT_CONNECT_TIMEOUT_MS=30000
+MQTT_TLS_INSECURE=0
+EOF
+  chmod 600 "$env_file"
+}
+
+sync_app_files() {
+  local dest="$1"
+  log "同步程式檔案到 $dest …"
+  mkdir -p "$dest/dist" "$dest/config" "$dest/data"
+  cp -f "$SOURCE_DIR/dist/index.js" "$dest/dist/index.js"
+  [[ -f "$SOURCE_DIR/dist/VERSION" ]] && cp -f "$SOURCE_DIR/dist/VERSION" "$dest/dist/VERSION"
+  cp -f "$SOURCE_DIR/package.json" "$dest/package.json"
+  cp -f "$SOURCE_DIR/package-lock.json" "$dest/package-lock.json"
+  [[ -f "$SOURCE_DIR/.env.example" ]] && cp -f "$SOURCE_DIR/.env.example" "$dest/.env.example"
+  if [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
+    cp -f "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
+    if [[ ! -f "$dest/config/device-identities.json" ]]; then
+      cp -f "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json"
+      log "已從範本建立 config/device-identities.json（請依現場修改）"
+    fi
+  fi
+  if [[ -f "$SOURCE_DIR/dpm-ctl.sh" ]]; then
+    cp -f "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
+    chmod +x "$dest/dpm-ctl.sh"
+  elif [[ -f "$SOURCE_DIR/scripts/dpm-ctl.sh" ]]; then
+    cp -f "$SOURCE_DIR/scripts/dpm-ctl.sh" "$dest/dpm-ctl.sh"
+    chmod +x "$dest/dpm-ctl.sh"
+  fi
+}
+
+link_git_from_source() {
+  local dest="$1"
+  if [[ -d "$SOURCE_DIR/.git" ]] && [[ ! -d "$dest/.git" ]]; then
+    log "複製 Git 中繼資料（與公開倉庫同版，上線後可 git pull）…"
+    cp -a "$SOURCE_DIR/.git" "$dest/.git"
+  fi
+
+  local manifest=""
+  for candidate in \
+    "$SOURCE_DIR/MANIFEST.json" \
+    "$SOURCE_DIR/../MANIFEST.json" \
+    "$(dirname "$SOURCE_DIR")/MANIFEST.json"; do
+    if [[ -f "$candidate" ]]; then
+      manifest="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$manifest" ]]; then
+    cp -f "$manifest" "$dest/MANIFEST.json"
+    if [[ -d "$dest/.git" ]]; then
+      local remote_url
+      remote_url="$(node -e "
+const fs = require('fs');
+const p = process.argv[1];
+try {
+  const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+  process.stdout.write(j.git_remote || '');
+} catch { process.stdout.write(''); }
+" "$manifest" 2>/dev/null || true)"
+      if [[ -n "$remote_url" ]]; then
+        if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+          git -C "$dest" remote set-url origin "$remote_url"
+        else
+          git -C "$dest" remote add origin "$remote_url"
+        fi
+        log "Git remote：$remote_url"
+      fi
+    fi
+  fi
+}
+
+install_dependencies() {
+  local dest="$1"
+  if [[ -d "$SOURCE_DIR/node_modules" ]] && [[ ! -d "$dest/node_modules" ]]; then
+    log "偵測到離線 node_modules，直接複製 …"
+    cp -a "$SOURCE_DIR/node_modules" "$dest/node_modules"
+    return
+  fi
+  log "執行 npm ci --omit=dev …"
+  cd "$dest"
+  npm ci --omit=dev
+}
+
+ensure_service_user() {
+  if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    log "建立系統使用者 $SERVICE_USER …"
+    useradd --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+  fi
+  if getent group dialout >/dev/null 2>&1; then
+    usermod -aG dialout "$SERVICE_USER" 2>/dev/null || true
+  fi
+}
+
+install_systemd_unit() {
+  local unit_src="$SOURCE_DIR/scripts/dpm-collector.service"
+  [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/dpm-collector.service"
+  [[ -f "$unit_src" ]] || die "找不到 dpm-collector.service"
+
+  sed "s|/opt/dpm-collector|$INSTALL_DIR|g" "$unit_src" \
+    > "/etc/systemd/system/${SERVICE_NAME}.service"
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME"
+}
+
+fix_permissions() {
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+  chmod 750 "$INSTALL_DIR"
+  chmod 750 "$INSTALL_DIR/data"
+  [[ -f "$INSTALL_DIR/.env" ]] && chmod 600 "$INSTALL_DIR/.env"
+}
+
+is_update_mode() {
+  [[ -f "$INSTALL_DIR/.env" ]] && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]
+}
+
+start_service() {
+  systemctl restart "$SERVICE_NAME"
+  sleep 2
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    log "✅ 服務 ${SERVICE_NAME} 運行中"
+    if [[ -f "$INSTALL_DIR/dist/VERSION" ]]; then
+      log "版本：$(head -n1 "$INSTALL_DIR/dist/VERSION")"
+    fi
+  else
+    die "服務啟動失敗，請執行：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+  fi
+}
+
+main() {
+  require_root
+  detect_system
+
+  if is_update_mode; then
+    log "偵測到既有安裝，進入更新模式 …"
+    sync_app_files "$INSTALL_DIR"
+    link_git_from_source "$INSTALL_DIR"
+    install_dependencies "$INSTALL_DIR"
+    verify_influxdb_ready
+    fix_permissions
+    start_service
+    log "✅ 更新完成"
+    exit 0
+  fi
+
+  log "初次安裝到 $INSTALL_DIR …"
+  mkdir -p "$INSTALL_DIR"
+  sync_app_files "$INSTALL_DIR"
+  link_git_from_source "$INSTALL_DIR"
+  ensure_nodejs
+  install_dependencies "$INSTALL_DIR"
+
+  if [[ ! -f "$INSTALL_DIR/.env" ]]; then
+    write_env_file "$INSTALL_DIR/.env"
+  else
+    log "保留既有 .env"
+  fi
+
+  ensure_service_user
+  install_systemd_unit
+  verify_influxdb_ready
+  fix_permissions
+  start_service
+
+  echo
+  log "✅ 安裝完成"
+  echo "   安裝目錄：$INSTALL_DIR"
+  echo "   管理工具：$INSTALL_DIR/dpm-ctl.sh status"
+  echo "   查看日誌：$INSTALL_DIR/dpm-ctl.sh logs"
+}
+
+main "$@"
