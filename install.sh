@@ -26,6 +26,39 @@ fi
 log() { echo "[install] $*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
+resolve_path() {
+  readlink -f "$1" 2>/dev/null || realpath "$1"
+}
+
+safe_cp() {
+  local src="$1" dst="$2"
+  [[ -f "$src" ]] || return 0
+  local src_real dst_real
+  src_real="$(resolve_path "$src")"
+  dst_real="$(resolve_path "$dst")"
+  if [[ "$src_real" == "$dst_real" ]]; then
+    return 0
+  fi
+  cp -f "$src" "$dst"
+}
+
+migrate_legacy_dist_layout() {
+  local root="$1"
+  if [[ -f "$root/dist/index.js" ]] && [[ ! -f "$root/index.js" ]]; then
+    log "偵測舊版 dist/ 布局，搬移主程式至根目錄 …"
+    safe_cp "$root/dist/index.js" "$root/index.js"
+    [[ -f "$root/dist/VERSION" ]] && safe_cp "$root/dist/VERSION" "$root/VERSION"
+  fi
+  if [[ -f "$root/package.json" ]] && [[ ! -f "$root/lib/package.json" ]]; then
+    log "偵測舊版根目錄 package.json，搬移至 lib/ …"
+    mkdir -p "$root/lib"
+    safe_cp "$root/package.json" "$root/lib/package.json"
+    safe_cp "$root/package-lock.json" "$root/lib/package-lock.json"
+    [[ -f "$root/dpm-collector.service" ]] && \
+      safe_cp "$root/dpm-collector.service" "$root/lib/dpm-collector.service"
+  fi
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "請以 root 執行：sudo $0"
@@ -303,41 +336,49 @@ EOF
 
 sync_app_files() {
   local dest="$1"
+  migrate_legacy_dist_layout "$dest"
   log "同步程式檔案到 $dest …"
   mkdir -p "$dest/config" "$dest/data" "$dest/lib"
   if [[ -f "$SOURCE_DIR/index.js" ]]; then
-    cp -f "$SOURCE_DIR/index.js" "$dest/index.js"
-    [[ -f "$SOURCE_DIR/VERSION" ]] && cp -f "$SOURCE_DIR/VERSION" "$dest/VERSION"
+    safe_cp "$SOURCE_DIR/index.js" "$dest/index.js"
+    [[ -f "$SOURCE_DIR/VERSION" ]] && safe_cp "$SOURCE_DIR/VERSION" "$dest/VERSION"
   elif [[ -f "$SOURCE_DIR/dist/index.js" ]]; then
-    cp -f "$SOURCE_DIR/dist/index.js" "$dest/index.js"
-    [[ -f "$SOURCE_DIR/dist/VERSION" ]] && cp -f "$SOURCE_DIR/dist/VERSION" "$dest/VERSION"
+    safe_cp "$SOURCE_DIR/dist/index.js" "$dest/index.js"
+    [[ -f "$SOURCE_DIR/dist/VERSION" ]] && safe_cp "$SOURCE_DIR/dist/VERSION" "$dest/VERSION"
   fi
   if [[ -f "$SOURCE_DIR/lib/package.json" ]]; then
-    cp -f "$SOURCE_DIR/lib/package.json" "$dest/lib/package.json"
-    cp -f "$SOURCE_DIR/lib/package-lock.json" "$dest/lib/package-lock.json"
+    safe_cp "$SOURCE_DIR/lib/package.json" "$dest/lib/package.json"
+    safe_cp "$SOURCE_DIR/lib/package-lock.json" "$dest/lib/package-lock.json"
     [[ -f "$SOURCE_DIR/lib/dpm-collector.service" ]] && \
-      cp -f "$SOURCE_DIR/lib/dpm-collector.service" "$dest/lib/dpm-collector.service"
+      safe_cp "$SOURCE_DIR/lib/dpm-collector.service" "$dest/lib/dpm-collector.service"
   elif [[ -f "$SOURCE_DIR/package.json" ]]; then
     # 相容舊版客戶 repo 根目錄 layout
-    cp -f "$SOURCE_DIR/package.json" "$dest/lib/package.json"
-    cp -f "$SOURCE_DIR/package-lock.json" "$dest/lib/package-lock.json"
+    safe_cp "$SOURCE_DIR/package.json" "$dest/lib/package.json"
+    safe_cp "$SOURCE_DIR/package-lock.json" "$dest/lib/package-lock.json"
     [[ -f "$SOURCE_DIR/dpm-collector.service" ]] && \
-      cp -f "$SOURCE_DIR/dpm-collector.service" "$dest/lib/dpm-collector.service"
+      safe_cp "$SOURCE_DIR/dpm-collector.service" "$dest/lib/dpm-collector.service"
   fi
-  [[ -f "$SOURCE_DIR/.env.example" ]] && cp -f "$SOURCE_DIR/.env.example" "$dest/.env.example"
+  [[ -f "$SOURCE_DIR/.env.example" ]] && safe_cp "$SOURCE_DIR/.env.example" "$dest/.env.example"
   if [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
-    cp -f "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
+    safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
     if [[ ! -f "$dest/config/device-identities.json" ]]; then
-      cp -f "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json"
+      safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json"
       log "已從範本建立 config/device-identities.json（請依現場修改）"
     fi
   fi
   if [[ -f "$SOURCE_DIR/dpm-ctl.sh" ]]; then
-    cp -f "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
+    safe_cp "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
     chmod +x "$dest/dpm-ctl.sh"
   elif [[ -f "$SOURCE_DIR/scripts/dpm-ctl.sh" ]]; then
-    cp -f "$SOURCE_DIR/scripts/dpm-ctl.sh" "$dest/dpm-ctl.sh"
+    safe_cp "$SOURCE_DIR/scripts/dpm-ctl.sh" "$dest/dpm-ctl.sh"
     chmod +x "$dest/dpm-ctl.sh"
+  fi
+
+  local src_real dest_real
+  src_real="$(resolve_path "$SOURCE_DIR")"
+  dest_real="$(resolve_path "$dest")"
+  if [[ "$src_real" == "$dest_real" ]]; then
+    log "來源與安裝目錄相同（git clone 就地安裝），略過重複複製"
   fi
 }
 
