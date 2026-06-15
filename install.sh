@@ -9,12 +9,16 @@ NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
 INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$SCRIPT_DIR/dist/index.js" ]]; then
+if [[ -f "$SCRIPT_DIR/index.js" ]]; then
   SOURCE_DIR="$SCRIPT_DIR"
+elif [[ -f "$SCRIPT_DIR/dist/index.js" ]]; then
+  SOURCE_DIR="$SCRIPT_DIR"
+elif [[ -f "$SCRIPT_DIR/../index.js" ]]; then
+  SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 elif [[ -f "$SCRIPT_DIR/../dist/index.js" ]]; then
   SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 else
-  echo "❌ 找不到 dist/index.js，請在解壓或 clone 後的套件根目錄執行 install.sh"
+  echo "❌ 找不到 index.js，請在 clone 或解壓後的套件根目錄執行 install.sh"
   exit 1
 fi
 
@@ -299,9 +303,14 @@ EOF
 sync_app_files() {
   local dest="$1"
   log "同步程式檔案到 $dest …"
-  mkdir -p "$dest/dist" "$dest/config" "$dest/data" "$dest/lib"
-  cp -f "$SOURCE_DIR/dist/index.js" "$dest/dist/index.js"
-  [[ -f "$SOURCE_DIR/dist/VERSION" ]] && cp -f "$SOURCE_DIR/dist/VERSION" "$dest/dist/VERSION"
+  mkdir -p "$dest/config" "$dest/data" "$dest/lib"
+  if [[ -f "$SOURCE_DIR/index.js" ]]; then
+    cp -f "$SOURCE_DIR/index.js" "$dest/index.js"
+    [[ -f "$SOURCE_DIR/VERSION" ]] && cp -f "$SOURCE_DIR/VERSION" "$dest/VERSION"
+  elif [[ -f "$SOURCE_DIR/dist/index.js" ]]; then
+    cp -f "$SOURCE_DIR/dist/index.js" "$dest/index.js"
+    [[ -f "$SOURCE_DIR/dist/VERSION" ]] && cp -f "$SOURCE_DIR/dist/VERSION" "$dest/VERSION"
+  fi
   if [[ -f "$SOURCE_DIR/lib/package.json" ]]; then
     cp -f "$SOURCE_DIR/lib/package.json" "$dest/lib/package.json"
     cp -f "$SOURCE_DIR/lib/package-lock.json" "$dest/lib/package-lock.json"
@@ -428,8 +437,8 @@ start_service() {
   sleep 2
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     log "✅ 服務 ${SERVICE_NAME} 運行中"
-    if [[ -f "$INSTALL_DIR/dist/VERSION" ]]; then
-      log "版本：$(head -n1 "$INSTALL_DIR/dist/VERSION")"
+    if [[ -f "$INSTALL_DIR/VERSION" ]]; then
+      log "版本：$(head -n1 "$INSTALL_DIR/VERSION")"
     fi
   else
     die "服務啟動失敗，請執行：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"

@@ -1,7 +1,7 @@
 # DPM-DA510/530 Modbus RTU 採集程式 — 客戶安裝說明
 
-本套件為 **已打包的執行程式**（`dist/index.js`），來自公開倉庫 **`dpm-collector-release`**（與開發倉庫分開）。  
-`git pull` **不會**取得 `src/` 原始碼或 `node_modules/`（依賴由 `install.sh` 在本機 `npm ci` 安裝）。
+本套件主程式為根目錄 **`index.js`**（已打包，無 `src/`），來自公開倉庫 **`dpm-collector-release`**。  
+`git pull` 後執行 `install.sh` 或 `dpm-ctl update` 即可；**不必**手動編輯 `lib/`（依賴鎖定與 systemd 範本由安裝腳本自動處理）。
 
 ---
 
@@ -23,7 +23,7 @@ cd /opt/dpm-collector
 sudo ./install.sh
 ```
 
-> 倉庫以 **`dist/`** 為主；`node_modules` 由 `install.sh` 自動安裝，不在 Git 內。`lib/` 為內部檔，無需手動修改。
+> 倉庫根目錄即為可執行程式；`node_modules` 由 `install.sh` 自動安裝，不在 Git 內。`lib/` 為內部檔，無需手動修改。
 
 安裝腳本會：
 
@@ -152,7 +152,7 @@ sudo /opt/dpm-collector/dpm-ctl.sh restart
 ## 版本查詢
 
 ```bash
-cat /opt/dpm-collector/dist/VERSION
+cat /opt/dpm-collector/VERSION
 ```
 
 ---
@@ -184,7 +184,7 @@ sudo journalctl -u dpm-collector -n 50 --no-pager
 回報問題時請附上：
 
 ```bash
-cat /opt/dpm-collector/dist/VERSION
+cat /opt/dpm-collector/VERSION
 sudo /opt/dpm-collector/dpm-ctl.sh status
 uname -a
 ```
