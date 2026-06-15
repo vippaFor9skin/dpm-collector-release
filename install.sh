@@ -7,6 +7,7 @@ SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
 SERVICE_USER="${SERVICE_USER:-dpm}"
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
 INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
+CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/index.js" ]]; then
@@ -360,8 +361,11 @@ link_git_from_source() {
 
   if [[ -n "$manifest" ]]; then
     cp -f "$manifest" "$dest/MANIFEST.json"
-    if [[ -d "$dest/.git" ]]; then
-      local remote_url
+  fi
+
+  if [[ -d "$dest/.git" ]]; then
+    local remote_url=""
+    if [[ -n "$manifest" ]]; then
       remote_url="$(node -e "
 const fs = require('fs');
 const p = process.argv[1];
@@ -370,14 +374,19 @@ try {
   process.stdout.write(j.git_remote || '');
 } catch { process.stdout.write(''); }
 " "$manifest" 2>/dev/null || true)"
-      if [[ -n "$remote_url" ]]; then
-        if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
-          git -C "$dest" remote set-url origin "$remote_url"
-        else
-          git -C "$dest" remote add origin "$remote_url"
-        fi
-        log "Git remote：$remote_url"
+    fi
+    if [[ -n "$remote_url" ]]; then
+      if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+        git -C "$dest" remote set-url origin "$remote_url"
+      else
+        git -C "$dest" remote add origin "$remote_url"
       fi
+      log "Git remote：$remote_url"
+    elif ! git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+      git -C "$dest" remote add origin "$CLIENT_GIT_REPO_URL"
+      log "Git remote：$CLIENT_GIT_REPO_URL（預設）"
+    else
+      log "Git remote：$(git -C "$dest" remote get-url origin)"
     fi
   fi
 }

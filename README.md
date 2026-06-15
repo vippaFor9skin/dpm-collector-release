@@ -18,7 +18,7 @@
 
 ```bash
 sudo mkdir -p /opt
-sudo git clone https://github.com/<org>/dpm-collector-release.git /opt/dpm-collector
+sudo git clone https://github.com/vippaFor9skin/dpm-collector-release.git /opt/dpm-collector
 cd /opt/dpm-collector
 sudo ./install.sh
 ```
