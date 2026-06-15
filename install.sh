@@ -285,7 +285,7 @@ write_env_file() {
   mqtt_user="$(prompt "MQTT 使用者名稱（可留空）" "")"
   mqtt_pass="$(prompt_secret "MQTT 密碼（可留空）")"
   serial_port="$(prompt "請輸入序列埠" "/dev/ttyUSB0")"
-  slave_ids="$(prompt "Modbus Slave IDs（逗號分隔）" "1,2,3,4,5,6,7,8,9,10")"
+  slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
   poll_ms="$(prompt "輪詢間隔毫秒" "5000")"
   if prompt_yes_no "MONITOR_ONLY 模式（僅監看、不送 MQTT）？" "n"; then
     monitor_only="1"
@@ -464,8 +464,13 @@ install_systemd_unit() {
   [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/scripts/dpm-collector.service"
   [[ -f "$unit_src" ]] || die "找不到 dpm-collector.service（lib/ 或舊版根目錄）"
 
-  sed "s|/opt/dpm-collector|$INSTALL_DIR|g" "$unit_src" \
-    > "/etc/systemd/system/${SERVICE_NAME}.service"
+  local node_bin
+  node_bin="$(command -v node || true)"
+  [[ -n "$node_bin" ]] || die "找不到 node 執行檔"
+
+  sed -e "s|/opt/dpm-collector|$INSTALL_DIR|g" \
+      -e "s|/usr/bin/node|$node_bin|g" \
+    "$unit_src" > "/etc/systemd/system/${SERVICE_NAME}.service"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME"
 }
@@ -482,6 +487,58 @@ is_update_mode() {
     && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]
 }
 
+validate_runtime_config() {
+  local dest="$1"
+  [[ -f "$dest/index.js" ]] || die "找不到 $dest/index.js"
+  [[ -f "$dest/.env" ]] || die "找不到 $dest/.env"
+  [[ -f "$dest/config/device-identities.json" ]] || \
+    die "找不到 $dest/config/device-identities.json（請依現場 SLAVE_ID 填寫 guid / component_type）"
+
+  if [[ ! -e "${SERIAL_PORT:-/dev/ttyUSB0}" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    # shellcheck source=/dev/null
+    source "$dest/.env"
+    set +a
+  fi
+  if [[ ! -e "${SERIAL_PORT:-/dev/ttyUSB0}" ]]; then
+    log "⚠️  序列埠 ${SERIAL_PORT:-/dev/ttyUSB0} 尚不存在（未接 RS-485 時服務可能無法啟動）"
+  fi
+
+  if ! (
+    cd "$dest"
+    node <<'NODE'
+require('dotenv').config({ path: '.env' });
+const fs = require('fs');
+const slaveIds = String(process.env.MODBUS_SLAVE_IDS || '')
+  .split(',')
+  .map((s) => parseInt(s.trim(), 10))
+  .filter((n) => Number.isInteger(n) && n >= 1 && n <= 247);
+let ident = {};
+try {
+  ident = JSON.parse(fs.readFileSync('config/device-identities.json', 'utf8'));
+} catch (e) {
+  console.error('❌ 無法讀取 config/device-identities.json:', e.message);
+  process.exit(1);
+}
+const missing = slaveIds.filter((id) => {
+  const row = ident[String(id)];
+  return !row || !row.guid || !row.component_type || !row.device_id;
+});
+if (missing.length) {
+  console.error(
+    '❌ MODBUS_SLAVE_IDS 與 device-identities.json 不一致，缺少 SLAVE_ID:',
+    missing.join(',')
+  );
+  console.error('   請編輯 config/device-identities.json，或改 .env 的 MODBUS_SLAVE_IDS');
+  process.exit(1);
+}
+NODE
+  ); then
+    die "設定檢查未通過（見上方訊息）"
+  fi
+}
+
 start_service() {
   systemctl restart "$SERVICE_NAME"
   sleep 2
@@ -491,7 +548,9 @@ start_service() {
       log "版本：$(head -n1 "$INSTALL_DIR/VERSION")"
     fi
   else
-    die "服務啟動失敗，請執行：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    echo "--- journalctl -u ${SERVICE_NAME} -n 30 --no-pager ---" >&2
+    journalctl -u "$SERVICE_NAME" -n 30 --no-pager >&2 || true
+    die "服務啟動失敗（常見：MODBUS_SLAVE_IDS 與 device-identities 不符、序列埠不存在、MQTT 設定缺漏）"
   fi
 }
 
@@ -505,6 +564,7 @@ main() {
     link_git_from_source "$INSTALL_DIR"
     install_dependencies "$INSTALL_DIR"
     verify_influxdb_ready
+    validate_runtime_config "$INSTALL_DIR"
     fix_permissions
     start_service
     log "✅ 更新完成"
@@ -527,6 +587,7 @@ main() {
   ensure_service_user
   install_systemd_unit
   verify_influxdb_ready
+  validate_runtime_config "$INSTALL_DIR"
   fix_permissions
   start_service
 
