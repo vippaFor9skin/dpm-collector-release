@@ -833,7 +833,7 @@ EOF
     local created creds
     created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
     resolve_influx_credentials creds "$created" || \
-      die "無法建立 InfluxDB Token。請在本機執行 influx org list 確認已登入，或刪除舊 Influx 資料後重裝"
+      die "無法建立 InfluxDB Token。請確認 sudo 執行者（${SUDO_USER:-root}）曾 influx setup，或執行：sudo -u ${SUDO_USER:-$USER} influx org list"
     IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
   fi
 
@@ -1286,6 +1286,10 @@ fix_permissions() {
   chmod 750 "$INSTALL_DIR"
   chmod 750 "$INSTALL_DIR/data"
   [[ -f "$INSTALL_DIR/.env" ]] && chmod 600 "$INSTALL_DIR/.env"
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    usermod -aG "$SERVICE_USER" "$SUDO_USER" 2>/dev/null || true
+    log "已將 $SUDO_USER 加入 $SERVICE_USER 群組（請重新登入 SSH 後可直接存取 $INSTALL_DIR）"
+  fi
 }
 
 is_update_mode() {
