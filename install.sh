@@ -637,18 +637,6 @@ detect_serial_ports() {
   } | sort -u
 }
 
-log_usb_serial_hint() {
-  echo "" >&2
-  echo "說明：此選單僅列出 USB「序列埠／RS-485 轉接器」（/dev/ttyUSB*、/dev/ttyACM*）。" >&2
-  echo "      滑鼠、鍵盤、無線網卡等一般 USB 裝置不會出現在此。" >&2
-  if command -v lsusb >/dev/null 2>&1; then
-    echo "" >&2
-    echo "目前已連接的 USB 裝置（僅供參考，多數非序列埠）：" >&2
-    lsusb 2>/dev/null | sed 's/^/  /' >&2 || true
-  fi
-  echo "" >&2
-}
-
 serial_port_desc() {
   local dev="$1" real link base props
   real="$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")"
@@ -669,36 +657,42 @@ serial_port_desc() {
 
 prompt_serial_port() {
   local -a ports=()
-  local line i choice desc default_choice default_manual="/dev/ttyUSB0"
+  local line i choice desc manual_idx default_choice default_manual="/dev/ttyUSB0"
 
   while IFS= read -r line; do
     [[ -n "$line" ]] && ports+=("$line")
   done < <(detect_serial_ports)
 
+  manual_idx=$((${#ports[@]} + 1))
+
+  echo "" >&2
+  echo "請選擇 Modbus 序列埠（RS-485／USB 轉串口；滑鼠、鍵盤、網卡不在此列）：" >&2
   if [[ ${#ports[@]} -eq 0 ]]; then
-    log_usb_serial_hint
-    log "未偵測到 RS-485／USB 序列埠；請確認轉接器已插入，或手動輸入裝置路徑"
-    prompt "請手動輸入序列埠" "$default_manual"
-    return
+    echo "  （目前未偵測到 /dev/ttyUSB* 或 /dev/ttyACM*）" >&2
+  else
+    for i in "${!ports[@]}"; do
+      desc="$(serial_port_desc "${ports[$i]}")"
+      if [[ -n "$desc" ]]; then
+        printf '  %d) %s  (%s)\n' "$((i + 1))" "${ports[$i]}" "$desc" >&2
+      else
+        printf '  %d) %s\n' "$((i + 1))" "${ports[$i]}" >&2
+      fi
+    done
+  fi
+  printf '  %d) 手動輸入路徑（預設 %s）\n' "$manual_idx" "$default_manual" >&2
+  echo "" >&2
+
+  if [[ ${#ports[@]} -gt 0 ]]; then
+    default_choice=1
+  else
+    default_choice="$manual_idx"
   fi
 
-  echo "偵測到以下 RS-485／USB 序列埠：" >&2
-  for i in "${!ports[@]}"; do
-    desc="$(serial_port_desc "${ports[$i]}")"
-    if [[ -n "$desc" ]]; then
-      printf '  %d) %s  (%s)\n' "$((i + 1))" "${ports[$i]}" "$desc" >&2
-    else
-      printf '  %d) %s\n' "$((i + 1))" "${ports[$i]}" >&2
-    fi
-  done
-  echo "  0) 手動輸入其他路徑" >&2
-
-  default_choice=1
-  read -rp "? 請選擇序列埠 [${default_choice}]: " choice >&2
+  read -rp "? 請選擇 [${default_choice}]: " choice >&2
   choice="${choice:-$default_choice}"
 
-  if [[ "$choice" == "0" ]]; then
-    prompt "請輸入序列埠路徑" "${ports[0]}"
+  if [[ "$choice" == "$manual_idx" ]]; then
+    prompt "請輸入序列埠路徑" "${ports[0]:-$default_manual}"
     return
   fi
 
@@ -712,8 +706,12 @@ prompt_serial_port() {
     return
   fi
 
-  log "無效選擇，使用 ${ports[0]}"
-  printf '%s' "${ports[0]}"
+  if [[ ${#ports[@]} -gt 0 ]]; then
+    log "無效選擇，使用 ${ports[0]}"
+    printf '%s' "${ports[0]}"
+  else
+    prompt "請輸入序列埠路徑" "$default_manual"
+  fi
 }
 
 write_env_file() {
