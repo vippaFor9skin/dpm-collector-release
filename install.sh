@@ -621,6 +621,82 @@ prompt_yes_no() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
+detect_serial_ports() {
+  local p pattern
+  for pattern in /dev/ttyUSB* /dev/ttyACM*; do
+    for p in $pattern; do
+      [[ -e "$p" && -c "$p" ]] || continue
+      printf '%s\n' "$p"
+    done
+  done | sort -u
+}
+
+serial_port_desc() {
+  local dev="$1" real link base props
+  real="$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")"
+  for link in /dev/serial/by-id/*; do
+    [[ -e "$link" ]] || continue
+    if [[ "$(readlink -f "$link" 2>/dev/null)" == "$real" ]]; then
+      base="$(basename "$link")"
+      printf '%s' "$base"
+      return 0
+    fi
+  done
+  if command -v udevadm >/dev/null 2>&1; then
+    props="$(udevadm info -q property -n "$dev" 2>/dev/null \
+      | awk -F= '/^ID_VENDOR=/ {v=$2} /^ID_MODEL=/ {m=$2} END {if (v||m) printf "%s %s", v, m}')"
+    [[ -n "$props" ]] && printf '%s' "$props"
+  fi
+}
+
+prompt_serial_port() {
+  local -a ports=()
+  local line i choice desc default_choice default_manual="/dev/ttyUSB0"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && ports+=("$line")
+  done < <(detect_serial_ports)
+
+  if [[ ${#ports[@]} -eq 0 ]]; then
+    log "未偵測到 USB 序列埠（ttyUSB / ttyACM），請確認 RS-485 轉接器已插入"
+    prompt "請手動輸入序列埠" "$default_manual"
+    return
+  fi
+
+  echo "偵測到以下 USB 序列埠：" >&2
+  for i in "${!ports[@]}"; do
+    desc="$(serial_port_desc "${ports[$i]}")"
+    if [[ -n "$desc" ]]; then
+      printf '  %d) %s  (%s)\n' "$((i + 1))" "${ports[$i]}" "$desc" >&2
+    else
+      printf '  %d) %s\n' "$((i + 1))" "${ports[$i]}" >&2
+    fi
+  done
+  echo "  0) 手動輸入其他路徑" >&2
+
+  default_choice=1
+  read -rp "? 請選擇序列埠 [${default_choice}]: " choice >&2
+  choice="${choice:-$default_choice}"
+
+  if [[ "$choice" == "0" ]]; then
+    prompt "請輸入序列埠路徑" "${ports[0]}"
+    return
+  fi
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ports[@]} )); then
+    printf '%s' "${ports[$((choice - 1))]}"
+    return
+  fi
+
+  if [[ -c "$choice" ]]; then
+    printf '%s' "$choice"
+    return
+  fi
+
+  log "無效選擇，使用 ${ports[0]}"
+  printf '%s' "${ports[0]}"
+}
+
 write_env_file() {
   local env_file="$1"
   log "建立 $env_file …"
@@ -636,7 +712,7 @@ write_env_file() {
   gateway_id="$(prompt "請輸入 GATEWAY_ID（後台 Gateway 主檔的識別碼）")"
   [[ -n "$gateway_id" ]] || die "GATEWAY_ID 不可為空"
 
-  serial_port="$(prompt "請輸入序列埠" "/dev/ttyUSB0")"
+  serial_port="$(prompt_serial_port)"
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
 
   log "MQTT / 輪詢使用預設：MQTT_URL=$mqtt_url MONITOR_ONLY=$monitor_only POLL_INTERVAL_MS=$poll_ms"
