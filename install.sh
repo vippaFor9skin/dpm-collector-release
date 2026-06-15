@@ -628,6 +628,14 @@ configure_influxdb_localhost() {
   log "⚠️  未找到 InfluxDB config.toml，請確認僅本機可連"
 }
 
+log_influx_credentials() {
+  local org="$1"
+  local bucket="$2"
+  local token="$3"
+  log "InfluxDB 設定：INFLUX_URL=${INFLUX_HOST} INFLUX_ORG=$org INFLUX_BUCKET=$bucket"
+  log "INFLUX_TOKEN=$token"
+}
+
 # 回傳 org|bucket|token（InfluxDB 為必填，供本地 7 天緩存）
 ensure_influxdb_for_install() {
   local influx_org="${INFLUX_ORG:-nineskin}"
@@ -693,6 +701,7 @@ EOF
 
   wait_for_influx_ping || die "InfluxDB 無法連線（${INFLUX_HOST}）"
 
+  log_influx_credentials "$influx_org" "$influx_bucket" "$influx_token"
   echo "$influx_org|$influx_bucket|$influx_token"
 }
 
