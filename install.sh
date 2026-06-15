@@ -821,11 +821,10 @@ log_mqtt_defaults() {
   local mqtt_user="$2"
   local monitor_only="$3"
   local poll_ms="$4"
-  log "MQTT 預設："
-  log "  MQTT_URL=$mqtt_url"
-  log "  MQTT_USERNAME=$mqtt_user"
-  log "  MONITOR_ONLY=$monitor_only"
-  log "  POLL_INTERVAL_MS=$poll_ms"
+  log "MQTT_URL=$mqtt_url"
+  log "MQTT_USERNAME=$mqtt_user"
+  log "MONITOR_ONLY=$monitor_only"
+  log "POLL_INTERVAL_MS=$poll_ms"
 }
 
 # 回傳 org|bucket|token（InfluxDB 為必填，供本地 7 天緩存）
