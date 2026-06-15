@@ -622,13 +622,31 @@ prompt_yes_no() {
 }
 
 detect_serial_ports() {
-  local p pattern
-  for pattern in /dev/ttyUSB* /dev/ttyACM*; do
-    for p in $pattern; do
-      [[ -e "$p" && -c "$p" ]] || continue
-      printf '%s\n' "$p"
+  local p link real pattern
+  {
+    for link in /dev/serial/by-id/*; do
+      [[ -e "$link" ]] || continue
+      real="$(readlink -f "$link" 2>/dev/null || continue)"
+      [[ -c "$real" ]] && printf '%s\n' "$real"
     done
-  done | sort -u
+    for pattern in /dev/ttyUSB* /dev/ttyACM*; do
+      for p in $pattern; do
+        [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
+      done
+    done
+  } | sort -u
+}
+
+log_usb_serial_hint() {
+  echo "" >&2
+  echo "說明：此選單僅列出 USB「序列埠／RS-485 轉接器」（/dev/ttyUSB*、/dev/ttyACM*）。" >&2
+  echo "      滑鼠、鍵盤、無線網卡等一般 USB 裝置不會出現在此。" >&2
+  if command -v lsusb >/dev/null 2>&1; then
+    echo "" >&2
+    echo "目前已連接的 USB 裝置（僅供參考，多數非序列埠）：" >&2
+    lsusb 2>/dev/null | sed 's/^/  /' >&2 || true
+  fi
+  echo "" >&2
 }
 
 serial_port_desc() {
@@ -658,12 +676,13 @@ prompt_serial_port() {
   done < <(detect_serial_ports)
 
   if [[ ${#ports[@]} -eq 0 ]]; then
-    log "未偵測到 USB 序列埠（ttyUSB / ttyACM），請確認 RS-485 轉接器已插入"
+    log_usb_serial_hint
+    log "未偵測到 RS-485／USB 序列埠；請確認轉接器已插入，或手動輸入裝置路徑"
     prompt "請手動輸入序列埠" "$default_manual"
     return
   fi
 
-  echo "偵測到以下 USB 序列埠：" >&2
+  echo "偵測到以下 RS-485／USB 序列埠：" >&2
   for i in "${!ports[@]}"; do
     desc="$(serial_port_desc "${ports[$i]}")"
     if [[ -n "$desc" ]]; then

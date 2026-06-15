@@ -9,7 +9,7 @@
 
 - Ubuntu 20.04+（64-bit）
 - Node.js **24+**（安裝腳本可自動安裝）
-- RS-485 USB 序列埠（如 `/dev/ttyUSB0`）
+- RS-485 USB 序列埠（如 `/dev/ttyUSB0`；`install.sh` 會自動列出已插入的轉接器，**不含**滑鼠／鍵盤／網卡）
 - InfluxDB 2（**必填**，`install.sh` 自動安裝；僅本機 127.0.0.1，保留 7 天）
 
 ---
