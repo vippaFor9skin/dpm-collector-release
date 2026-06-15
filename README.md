@@ -30,7 +30,7 @@ sudo ./install.sh
 1. 將程式部署到 `/opt/dpm-collector`
 2. 安裝 Node.js 24+（若尚未安裝）
 3. 執行 `npm ci` 安裝依賴
-4. 引導設定 `.env`（MQTT、Modbus、Gateway ID 等）
+4. **互動式建立 `.env`**（MQTT、Modbus、Gateway ID、InfluxDB Token 等；不必手動複製 `.env.example`）
 5. **自動安裝並初始化 InfluxDB 2**（本地 7 天緩存，僅本機可連）
 6. 建立 systemd 服務 `dpm-collector` 並啟動
 

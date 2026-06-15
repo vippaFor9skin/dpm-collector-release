@@ -406,6 +406,75 @@ MQTT_CONNECT_TIMEOUT_MS=30000
 MQTT_TLS_INSECURE=0
 EOF
   chmod 600 "$env_file"
+  log "✅ 已建立 $env_file（含 MQTT、Modbus、InfluxDB 設定）"
+}
+
+env_file_is_complete() {
+  local env_file="$1"
+  [[ -f "$env_file" ]] || return 1
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+  [[ -n "${GATEWAY_ID:-}" ]] || return 1
+  [[ -n "${INFLUX_URL:-}" && -n "${INFLUX_TOKEN:-}" && -n "${INFLUX_ORG:-}" && -n "${INFLUX_BUCKET:-}" ]] || return 1
+  [[ -n "${MODBUS_SLAVE_IDS:-}" ]] || return 1
+  [[ -n "${SERIAL_PORT:-}" ]] || return 1
+  return 0
+}
+
+repair_env_influx() {
+  local env_file="$1"
+  local setup_result influx_org influx_bucket influx_token
+  log "補齊 $env_file 的 InfluxDB 設定 …"
+  setup_result="$(ensure_influxdb_for_install)"
+  IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
+  influx_org="$(trim_value "$influx_org")"
+  influx_bucket="$(trim_value "$influx_bucket")"
+  influx_token="$(trim_value "$influx_token")"
+  [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
+    || die "InfluxDB 設定不完整（org/bucket/token）"
+
+  for key in INFLUX_URL INFLUX_TOKEN INFLUX_ORG INFLUX_BUCKET; do
+    sed -i "/^${key}=/d" "$env_file"
+  done
+  cat >> "$env_file" <<EOF
+INFLUX_URL=http://127.0.0.1:8086
+INFLUX_TOKEN=$influx_token
+INFLUX_ORG=$influx_org
+INFLUX_BUCKET=$influx_bucket
+EOF
+  chmod 600 "$env_file"
+  log "✅ 已更新 $env_file 的 InfluxDB 設定"
+}
+
+ensure_env_file() {
+  local env_file="$1"
+  if [[ ! -f "$env_file" ]]; then
+    write_env_file "$env_file"
+    return
+  fi
+
+  if env_file_is_complete "$env_file"; then
+    log "保留既有 .env"
+    return
+  fi
+
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+  if [[ -n "${GATEWAY_ID:-}" && -n "${MODBUS_SLAVE_IDS:-}" && -n "${SERIAL_PORT:-}" ]] \
+    && [[ -z "${INFLUX_TOKEN:-}" || -z "${INFLUX_ORG:-}" || -z "${INFLUX_BUCKET:-}" ]]; then
+    log "⚠️  既有 .env 缺少 InfluxDB 設定，自動補齊 …"
+    repair_env_influx "$env_file"
+    return
+  fi
+
+  log "⚠️  既有 .env 不完整，重新建立 …"
+  write_env_file "$env_file"
 }
 
 sync_app_files() {
@@ -660,11 +729,7 @@ main() {
   ensure_nodejs
   install_dependencies "$INSTALL_DIR"
 
-  if [[ ! -f "$INSTALL_DIR/.env" ]]; then
-    write_env_file "$INSTALL_DIR/.env"
-  else
-    log "保留既有 .env"
-  fi
+  ensure_env_file "$INSTALL_DIR/.env"
 
   ensure_service_user
   install_systemd_unit
