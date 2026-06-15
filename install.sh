@@ -31,9 +31,17 @@ fi
 log() { echo "[install] $*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
+log_section() {
+  if [[ -t 2 ]]; then
+    printf '\n\033[34m【%s】\033[0m\n' "$1" >&2
+  else
+    printf '\n【%s】\n' "$1" >&2
+  fi
+}
+
 log_highlight() {
   if [[ -t 2 ]]; then
-    printf '\033[33m%s\033[0m\n' "$*" >&2
+    printf '\033[34m%s\033[0m\n' "$*" >&2
   else
     printf '%s\n' "$*" >&2
   fi
@@ -49,13 +57,11 @@ countdown_progress_bar() {
   fi
   for ((i=1; i<=total; i++)); do
     n=$((i * width / total))
-    if [[ -t 2 ]]; then
-      printf '\r\033[33m[' >&2
-      for ((j=0; j<width; j++)); do
-        if ((j < n)); then printf '█' >&2; else printf '░' >&2; fi
-      done
-      printf '] %d/%ds\033[0m' "$i" "$total" >&2
-    fi
+    printf '\r[' >&2
+    for ((j=0; j<width; j++)); do
+      if ((j < n)); then printf '█' >&2; else printf '░' >&2; fi
+    done
+    printf '] %d/%ds' "$i" "$total" >&2
     sleep 1
   done
   echo >&2
@@ -1049,6 +1055,7 @@ prompt_serial_port() {
 
 write_env_file() {
   local env_file="$1"
+  log_section "設定檔"
   log "建立 $env_file …"
 
   local gateway_id serial_port slave_ids
@@ -1062,17 +1069,19 @@ write_env_file() {
   gateway_id="$(prompt "請輸入 GATEWAY_ID（後台 Gateway 主檔的識別碼）")"
   [[ -n "$gateway_id" ]] || die "GATEWAY_ID 不可為空"
 
+  log_section "Modbus"
   serial_port="$(prompt_serial_port)"
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
   slave_ids="${slave_ids//[\[\]]/}"
 
+  log_section "MQTT"
   log_mqtt_defaults "$mqtt_url" "$mqtt_user" "$monitor_only" "$poll_ms"
   mqtt_pass="$(prompt_secret "請輸入 MQTT_PASSWORD（Broker 密碼；直接 Enter 表示空密碼）")"
   if [[ -z "$mqtt_pass" && -z "${DEFAULT_MQTT_PASSWORD:-}" ]]; then
     log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
   fi
 
-  log "安裝 InfluxDB 2（必填：本地 7 天緩存，斷網時仍保存採樣）…"
+  log_section "InfluxDB"
   setup_result="$(ensure_influxdb_for_install)"
   IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
   influx_org="$(trim_value "$influx_org")"
@@ -1137,6 +1146,7 @@ env_file_is_complete() {
 repair_env_influx() {
   local env_file="$1"
   local setup_result influx_org influx_bucket influx_token
+  log_section "InfluxDB"
   log "補齊 $env_file 的 InfluxDB 設定 …"
   setup_result="$(ensure_influxdb_for_install)"
   IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
@@ -1470,17 +1480,22 @@ finish_install_success() {
 
 main() {
   require_root
+  log_section "環境"
   detect_system
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 
   if is_update_mode; then
+    log_section "更新"
     log "偵測到既有安裝，進入更新模式 …"
+    log_section "程式檔案"
     sync_app_files "$INSTALL_DIR"
     link_git_from_source "$INSTALL_DIR"
+    log_section "Node.js"
     install_dependencies "$INSTALL_DIR"
     verify_influxdb_ready
     validate_runtime_config "$INSTALL_DIR"
     fix_permissions
+    log_section "服務"
     start_service
     finish_install_success update
     exit 0
@@ -1488,18 +1503,22 @@ main() {
 
   log "初次安裝到 $INSTALL_DIR …"
   mkdir -p "$INSTALL_DIR"
+  log_section "程式檔案"
   sync_app_files "$INSTALL_DIR"
   link_git_from_source "$INSTALL_DIR"
+  log_section "Node.js"
   ensure_nodejs
   install_dependencies "$INSTALL_DIR"
 
   ensure_env_file "$INSTALL_DIR/.env"
 
+  log_section "systemd"
   ensure_service_user
   install_systemd_unit
   verify_influxdb_ready
   validate_runtime_config "$INSTALL_DIR"
   fix_permissions
+  log_section "服務"
   start_service
   finish_install_success install
 }
