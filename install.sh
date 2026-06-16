@@ -1541,7 +1541,7 @@ try {
 }
 const missing = slaveIds.filter((id) => {
   const row = ident[String(id)];
-  return !row || !row.guid || !row.component_type || !row.device_id;
+  return !row || !row.guid || !row.component_type;
 });
 if (missing.length) {
   console.error(
