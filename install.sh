@@ -53,7 +53,7 @@ die() { echo "❌ $*" >&2; exit 1; }
 
 log_section() {
   if [[ -t 2 ]]; then
-    printf '\n\033[34m【%s】\033[0m\n' "$1" >&2
+    printf '\n\033[96m【%s】\033[0m\n' "$1" >&2
   else
     printf '\n【%s】\n' "$1" >&2
   fi
@@ -61,7 +61,7 @@ log_section() {
 
 log_highlight() {
   if [[ -t 2 ]]; then
-    printf '\033[34m%s\033[0m\n' "$*" >&2
+    printf '\033[96m%s\033[0m\n' "$*" >&2
   else
     printf '%s\n' "$*" >&2
   fi
