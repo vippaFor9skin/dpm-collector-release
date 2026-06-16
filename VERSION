@@ -1,4 +1,4 @@
 dpm-da510-modbus-collector 1.0.0
-build: 2026-06-15
-git: fc8f3cc (2026-04-30)
-node: v20.18.2
+build: 2026-06-16
+git: 8cda62b (2026-06-16)
+node: v24.13.1

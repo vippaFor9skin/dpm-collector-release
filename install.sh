@@ -1,7 +1,24 @@
 #!/usr/bin/env bash
-# DPM-DA510/530 Modbus RTU Collector — one-click install / update for BL118 (Ubuntu 20.04+)
+# =============================================================================
+# install.sh — DPM-DA510/530 Modbus RTU Collector 一鍵安裝／更新
+#
+# 目標平台：BL118 等 Ubuntu 20.04+ 邊緣閘道器。
+# 執行方式：sudo ./install.sh（須 root，用於 apt、systemd、chown）。
+#
+# 安裝來源（自動偵測 SOURCE_DIR）：
+#   - 客戶 repo 根目錄（git clone / USB 的 dpm-collector/）
+#   - 開發 repo 的 scripts/ 或含 dist/ 的舊布局
+#
+# 主要流程（初次安裝）：
+#   環境檢查 → 同步檔案 → Node.js + npm ci → 互動建立 .env
+#   → InfluxDB 2（本地 7 天緩存）→ systemd → 權限 → 啟動服務
+#
+# 更新模式（is_update_mode）：已有 .env 且 systemd 單元存在時，
+#   保留 .env，僅同步程式、npm ci、驗證、重啟。
+# =============================================================================
 set -euo pipefail
 
+# --- 可覆寫的安裝參數（環境變數） ---
 INSTALL_DIR="${INSTALL_DIR:-/opt/dpm-collector}"
 SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
 SERVICE_USER="${SERVICE_USER:-dpm}"
@@ -14,6 +31,7 @@ DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
 DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-5000}"
 DEFAULT_MONITOR_ONLY="${DEFAULT_MONITOR_ONLY:-0}"
 
+# 判斷「腳本所在目錄」對應的套件根目錄（支援就地 git clone 安裝）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/index.js" ]]; then
   SOURCE_DIR="$SCRIPT_DIR"
@@ -28,6 +46,8 @@ else
   exit 1
 fi
 
+# --- 終端輸出（僅 install 流程使用；不影響服務日誌） ---
+# log_section / log_highlight 在非 TTY（例如 CI）時會降級為純文字。
 log() { echo "$*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
@@ -67,6 +87,7 @@ countdown_progress_bar() {
   echo >&2
 }
 
+# --- 檔案複製與舊版目錄布局遷移 ---
 resolve_path() {
   readlink -f "$1" 2>/dev/null || realpath "$1"
 }
@@ -83,6 +104,7 @@ safe_cp() {
   cp -f "$src" "$dst"
 }
 
+# 客戶 repo 已改為根目錄 index.js + lib/；此函式相容舊 dist/ 與根目錄 package.json。
 migrate_legacy_dist_layout() {
   local root="$1"
   if [[ -f "$root/dist/index.js" ]] && [[ ! -f "$root/index.js" ]]; then
@@ -100,6 +122,7 @@ migrate_legacy_dist_layout() {
   fi
 }
 
+# --- 系統前置檢查 ---
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "請以 root 執行：sudo $0"
@@ -120,6 +143,7 @@ detect_system() {
   fi
 }
 
+# --- Node.js（採集程式執行環境，預設 24+） ---
 node_major() {
   if ! command -v node >/dev/null 2>&1; then
     echo 0
@@ -151,6 +175,9 @@ ensure_nodejs() {
   fi
 }
 
+# --- InfluxDB 2（本地時序緩存，斷網期間仍保存採樣） ---
+# INFLUX_HOST：influx CLI 與 curl 共用；勿用 influx --host（部分版本不支援）。
+# 健康檢查優先 curl /health，避免 sudo 下 PATH 缺 curl 導致誤判。
 install_influxdb_apt() {
   log "安裝 InfluxDB 2（apt）…"
   apt-get update -qq
@@ -302,6 +329,8 @@ resolve_influx_credentials() {
   printf -v "$_var" '%s|%s|%s' "$influx_org" "$influx_bucket" "$influx_token"
 }
 
+# Influx 已初始化時，sudo 執行者（SUDO_USER）的 influx CLI 常有有效 token，
+# 但 root 自己沒有 ~/.influxdbv2/configs；以下函式以 SUDO_USER 身份跑 influx。
 influx_sudo_user() {
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     printf '%s' "$SUDO_USER"
@@ -677,6 +706,7 @@ influx_setup_force_rebind() {
     --force
 }
 
+# 在已初始化的 Influx 上建立採集專用 token；失敗時嘗試沿用 SUDO_USER 的 CLI token。
 create_collector_influx_token() {
   local org="$1"
   local bucket="$2"
@@ -905,6 +935,7 @@ verify_influxdb_ready() {
   fi
 }
 
+# --- 互動式輸入與 .env 值格式化 ---
 prompt() {
   local msg="$1"
   local default="${2:-}"
@@ -935,6 +966,7 @@ trim_value() {
   printf '%s' "$v"
 }
 
+# .env 含特殊字元時加雙引號並跳脫，避免 systemd EnvironmentFile 解析錯誤。
 format_dotenv_value() {
   local v="$1"
   [[ -n "$v" ]] || return 0
@@ -958,6 +990,7 @@ prompt_yes_no() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
+# --- Modbus 序列埠偵測（僅 ttyUSB* / ttyACM* / by-id；不含滑鼠鍵盤） ---
 detect_serial_ports() {
   local p link real pattern
   {
@@ -1049,6 +1082,109 @@ prompt_serial_port() {
   fi
 }
 
+# 寫入含中文備註的 .env（欄位說明對照開發倉 .env.example）。
+write_env_file_content() {
+  local env_file="$1"
+  local serial_port="$2"
+  local slave_ids="$3"
+  local monitor_only="$4"
+  local poll_ms="$5"
+  local influx_org="$6"
+  local influx_bucket="$7"
+  local influx_token="$8"
+  local mqtt_url="$9"
+  local mqtt_user="${10}"
+  local mqtt_pass="${11}"
+  local gateway_id="${12}"
+
+  cat > "$env_file" <<EOF
+# ---------------------------------------------------------------------------
+# 本檔由 install.sh 產生（$(date -Iseconds)）
+# 修改後請執行：sudo systemctl restart dpm-collector
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 序列埠（RS-485 轉 USB）
+# Linux 常見為 /dev/ttyUSB0 或 /dev/ttyACM0
+# ---------------------------------------------------------------------------
+SERIAL_PORT=$serial_port
+MODBUS_BAUD_RATE=9600
+MODBUS_DATA_BITS=8
+MODBUS_STOP_BITS=2
+MODBUS_PARITY=none
+# 多設備輪詢（最多 10 台，逗號分隔；須與 config/device-identities.json 的 key 一致）
+MODBUS_SLAVE_IDS=$slave_ids
+MODBUS_TIMEOUT_MS=1000
+
+# ---------------------------------------------------------------------------
+# 時區：影響 sampled_at 時間標記
+# ---------------------------------------------------------------------------
+TIMEZONE=Asia/Taipei
+
+# ---------------------------------------------------------------------------
+# 僅本機檢測：1 時不連 MQTT，仍寫 SQLite + Influx；改回 0 重啟後可補送佇列
+# ---------------------------------------------------------------------------
+MONITOR_ONLY=$monitor_only
+
+# ---------------------------------------------------------------------------
+# Float 讀值異常時可改 MODBUS_FLOAT_SWAP_WORDS=1 試交換 word 順序
+# ---------------------------------------------------------------------------
+MODBUS_FLOAT_SWAP_WORDS=0
+
+# 設備身分對照（JSON；key 為 slave_id）；請先編輯再 install
+DEVICE_IDENTITIES_FILE=config/device-identities.json
+# 輪詢間隔（毫秒）；第一次讀取也在間隔後才執行
+POLL_INTERVAL_MS=$poll_ms
+
+# ---------------------------------------------------------------------------
+# MQTT 永續佇列（SQLite）；斷網累積、恢復後補送
+# ---------------------------------------------------------------------------
+SQLITE_OUTBOX_PATH=data/dpm.db
+OUTBOX_FLUSH_BATCH=200
+
+# ---------------------------------------------------------------------------
+# InfluxDB 2（必填）：本地 7 天緩存；僅監聽 127.0.0.1:8086
+# Token 由 install.sh 建立；管理資訊備份見 /root/dpm-collector-influx-admin.txt
+# ---------------------------------------------------------------------------
+INFLUX_URL=http://127.0.0.1:8086
+INFLUX_TOKEN=$influx_token
+INFLUX_ORG=$influx_org
+INFLUX_BUCKET=$influx_bucket
+INFLUX_MEASUREMENT=dpm
+INFLUX_WRITE_TIMEOUT_MS=20000
+INFLUX_SOURCE_TAG=dpm
+
+# ---------------------------------------------------------------------------
+# MQTT（MONITOR_ONLY=0 時必填）
+# 每筆為 UTF-8 JSON：component_type, guid, parameters, sampled_at
+# ---------------------------------------------------------------------------
+MQTT_URL=$mqtt_url
+# 週期資料 topic；佔位僅支援 {gatewayId}
+MQTT_DATA_TOPIC=gw/data/{gatewayId}
+# 啟動設備清單 topic（必填）
+MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
+
+# 與後台 Gateway 主檔 gateway_id 一致（topic 佔位用，非 MQTT clientId）
+GATEWAY_ID=$gateway_id
+
+# Broker 連線 clientId；留白時以 GATEWAY_ID 帶入
+MQTT_CLIENT_ID=
+
+# Broker 帳密（若 MQTT_URL 未內嵌帳密時使用）
+MQTT_USERNAME=$mqtt_user
+MQTT_PASSWORD=$(format_dotenv_value "$mqtt_pass")
+
+# 發布 QoS：0 / 1 / 2
+MQTT_QOS=1
+MQTT_CONNECT_TIMEOUT_MS=30000
+
+# mqtts:// 自簽憑證測試用；正式環境請保持 0
+MQTT_TLS_INSECURE=0
+EOF
+}
+
+# 互動建立 .env：GATEWAY_ID → Modbus → MQTT → InfluxDB。
+# log_section 標題僅影響終端顯示，不寫入 .env。
 write_env_file() {
   local env_file="$1"
   log_section "設定檔"
@@ -1086,40 +1222,10 @@ write_env_file() {
   [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
     || die "InfluxDB 設定不完整（org/bucket/token）"
 
-  cat > "$env_file" <<EOF
-# Generated by install.sh on $(date -Iseconds)
-SERIAL_PORT=$serial_port
-MODBUS_BAUD_RATE=9600
-MODBUS_DATA_BITS=8
-MODBUS_STOP_BITS=2
-MODBUS_PARITY=none
-MODBUS_SLAVE_IDS=$slave_ids
-MODBUS_TIMEOUT_MS=1000
-TIMEZONE=Asia/Taipei
-MONITOR_ONLY=$monitor_only
-MODBUS_FLOAT_SWAP_WORDS=0
-DEVICE_IDENTITIES_FILE=config/device-identities.json
-POLL_INTERVAL_MS=$poll_ms
-SQLITE_OUTBOX_PATH=data/dpm.db
-OUTBOX_FLUSH_BATCH=200
-INFLUX_URL=http://127.0.0.1:8086
-INFLUX_TOKEN=$influx_token
-INFLUX_ORG=$influx_org
-INFLUX_BUCKET=$influx_bucket
-INFLUX_MEASUREMENT=dpm
-INFLUX_WRITE_TIMEOUT_MS=20000
-INFLUX_SOURCE_TAG=dpm
-MQTT_URL=$mqtt_url
-MQTT_DATA_TOPIC=gw/data/{gatewayId}
-MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
-GATEWAY_ID=$gateway_id
-MQTT_CLIENT_ID=
-MQTT_USERNAME=$mqtt_user
-MQTT_PASSWORD=$(format_dotenv_value "$mqtt_pass")
-MQTT_QOS=1
-MQTT_CONNECT_TIMEOUT_MS=30000
-MQTT_TLS_INSECURE=0
-EOF
+  write_env_file_content "$env_file" \
+    "$serial_port" "$slave_ids" "$monitor_only" "$poll_ms" \
+    "$influx_org" "$influx_bucket" "$influx_token" \
+    "$mqtt_url" "$mqtt_user" "$mqtt_pass" "$gateway_id"
   chmod 600 "$env_file"
   log "✅ 已建立 $env_file（含 MQTT、Modbus、InfluxDB 設定）"
 }
@@ -1152,19 +1258,29 @@ repair_env_influx() {
   [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
     || die "InfluxDB 設定不完整（org/bucket/token）"
 
-  for key in INFLUX_URL INFLUX_TOKEN INFLUX_ORG INFLUX_BUCKET; do
+  for key in INFLUX_URL INFLUX_TOKEN INFLUX_ORG INFLUX_BUCKET INFLUX_MEASUREMENT \
+    INFLUX_WRITE_TIMEOUT_MS INFLUX_SOURCE_TAG; do
     sed -i "/^${key}=/d" "$env_file"
   done
+
   cat >> "$env_file" <<EOF
+
+# ---------------------------------------------------------------------------
+# InfluxDB 2（必填）：以下由 install.sh 補齊（$(date -Iseconds)）
+# ---------------------------------------------------------------------------
 INFLUX_URL=http://127.0.0.1:8086
 INFLUX_TOKEN=$influx_token
 INFLUX_ORG=$influx_org
 INFLUX_BUCKET=$influx_bucket
+INFLUX_MEASUREMENT=dpm
+INFLUX_WRITE_TIMEOUT_MS=20000
+INFLUX_SOURCE_TAG=dpm
 EOF
   chmod 600 "$env_file"
   log "✅ 已更新 $env_file 的 InfluxDB 設定"
 }
 
+# 已有 .env 時：完整則保留；缺 Influx 則補齊；否則整份重建。
 ensure_env_file() {
   local env_file="$1"
   if [[ ! -f "$env_file" ]]; then
@@ -1193,6 +1309,7 @@ ensure_env_file() {
   write_env_file "$env_file"
 }
 
+# 將 SOURCE_DIR 白名單檔案複製到 INSTALL_DIR；就地安裝時 safe_cp 會跳過同路徑。
 sync_app_files() {
   local dest="$1"
   migrate_legacy_dist_layout "$dest"
@@ -1306,6 +1423,8 @@ try {
   fi
 }
 
+# npm ci 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
+# USB / 離線包若已含 node_modules 則直接複製，跳過 npm。
 install_dependencies() {
   local dest="$1"
   if [[ -d "$SOURCE_DIR/node_modules" ]] && [[ ! -d "$dest/node_modules" ]]; then
@@ -1349,6 +1468,8 @@ install_systemd_unit() {
   systemctl enable "$SERVICE_NAME"
 }
 
+# 權限模型：安裝者（SUDO_USER）擁有檔案、dpm 群組可讀；data/ 僅 dpm 可寫。
+# 目的：工程師可 git pull / 編輯 config，服務帳號仍可讀 .env 與程式。
 fix_permissions() {
   local install_owner="${SUDO_USER:-root}"
   local data_dir="$INSTALL_DIR/data"
@@ -1377,11 +1498,13 @@ fix_permissions() {
   log "目錄權限：${install_owner} 可編輯與 git pull；服務帳號 ${SERVICE_USER} 經群組讀取設定"
 }
 
+# 是否為「更新」：有 .env、systemd 單元、/etc 內 unit 檔皆存在。
 is_update_mode() {
   [[ -f "$INSTALL_DIR/.env" ]] && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 \
     && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]
 }
 
+# 啟動服務前以 Node 腳本驗證：slave id 與 device-identities 一致、Influx 四項齊全。
 validate_runtime_config() {
   local dest="$1"
   [[ -f "$dest/index.js" ]] || die "找不到 $dest/index.js"
@@ -1441,6 +1564,7 @@ NODE
   fi
 }
 
+# 重啟 systemd 服務；失敗時印出最近 journal 供除錯。
 start_service() {
   systemctl restart "$SERVICE_NAME"
   sleep 2
@@ -1456,6 +1580,7 @@ start_service() {
   fi
 }
 
+# 安裝成功後：提示 → 5 秒進度條 → clear → 即時日誌 → status（日誌可 Ctrl+C 離開）。
 finish_install_success() {
   local mode="${1:-install}"
   echo
@@ -1477,6 +1602,7 @@ finish_install_success() {
   "$INSTALL_DIR/dpm-ctl.sh" status || true
 }
 
+# --- 主流程 ---
 main() {
   require_root
   log_section "環境"

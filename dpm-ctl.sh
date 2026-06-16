@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# DPM Collector service management tool
+# =============================================================================
+# dpm-ctl.sh — DPM Collector 現場維運工具
+#
+# 安裝後位於 /opt/dpm-collector/dpm-ctl.sh，由 systemd 以外的工程師手動呼叫。
+# 多數指令需 root（或 sudo）才能操作 systemd / 讀取 .env。
+#
+# 典型用法：
+#   sudo ./dpm-ctl.sh status
+#   sudo ./dpm-ctl.sh logs -n 50
+#   sudo ./dpm-ctl.sh update          # git pull + install.sh（更新模式）
+#   sudo ./dpm-ctl.sh test-mqtt
+# =============================================================================
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/dpm-collector}"
@@ -30,7 +41,8 @@ require_install_dir() {
   [[ -d "$INSTALL_DIR" ]] || die "找不到安裝目錄 $INSTALL_DIR"
 }
 
-# 僅顯示程式輸出，不帶 journal 的「Jun 15 … dpm-collector[pid]:」前綴
+# journalctl 預設會加上「Jun 15 … dpm-collector[pid]:」前綴；
+# -o cat 只輸出應用程式自己印的內容（與程式內台北時間戳一致）。
 journal_app_logs() {
   journalctl -u "$SERVICE_NAME" -o cat "$@"
 }
@@ -50,6 +62,7 @@ cmd_logs() {
   journal_app_logs -f -n "$lines"
 }
 
+# sudo 與 clone 擁有者不同時，root 執行 git 可能觸發 safe.directory 錯誤。
 ensure_git_safe_directory() {
   local dir
   dir="$(readlink -f "$INSTALL_DIR" 2>/dev/null || realpath "$INSTALL_DIR")"
@@ -67,10 +80,12 @@ ensure_git_safe_directory() {
   fi
 }
 
+# 更新流程：pull → install.sh（偵測為更新模式，保留 .env，重裝依賴與重啟服務）。
 cmd_update() {
   require_install_dir
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     ensure_git_safe_directory
+    # 目錄擁有者為工程師時可直接 pull；否則 fallback sudo。
     if [[ -w "$INSTALL_DIR" ]] && [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
       git -C "$INSTALL_DIR" pull
     elif [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -90,6 +105,7 @@ cmd_update() {
   fi
 }
 
+# 逐項檢查 .env 必填欄位與 device-identities.json、influxdb 服務狀態。
 cmd_check_config() {
   require_install_dir
   local env_file="$INSTALL_DIR/.env"
@@ -146,6 +162,7 @@ cmd_check_config() {
   [[ "$ok" -eq 1 ]] && echo "✅ 設定檢查通過" || die "設定檢查未通過"
 }
 
+# 先 influx ping，再以官方 JS client 打 API（與採集程式相同依賴）。
 cmd_test_influx() {
   require_install_dir
   if ! systemctl is-active --quiet influxdb 2>/dev/null; then
@@ -180,6 +197,7 @@ pingApi.getPing().then(() => {
 "
 }
 
+# 單次連線測試，不發布資料；clientId 加 -test 後綴避免與正式服務衝突。
 cmd_test_mqtt() {
   require_install_dir
   cd "$INSTALL_DIR"
@@ -201,6 +219,7 @@ setTimeout(() => { console.error('❌ MQTT 連線逾時'); process.exit(1); }, 1
 "
 }
 
+# 讀取第一個 MODBUS_SLAVE_IDS 的 holding register 40001（2 words）做連線抽測。
 cmd_test_modbus() {
   require_install_dir
   cd "$INSTALL_DIR"
