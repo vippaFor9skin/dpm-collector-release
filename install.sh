@@ -1156,7 +1156,7 @@ INFLUX_SOURCE_TAG=dpm
 
 # ---------------------------------------------------------------------------
 # MQTT（MONITOR_ONLY=0 時必填）
-# 每筆為 UTF-8 JSON：component_type, guid, parameters, sampled_at
+# 每筆為 UTF-8 JSON：guid, parameters, sampled_at
 # ---------------------------------------------------------------------------
 MQTT_URL=$mqtt_url
 # 週期資料 topic；佔位僅支援 {gatewayId}
@@ -1342,6 +1342,18 @@ sync_app_files() {
       log "已從範本建立 config/device-identities.json（請依現場修改）"
     fi
   fi
+  # 若來源端有手動建立的 device-identities.json（非 .example），同步到安裝目錄
+  if [[ -f "$SOURCE_DIR/config/device-identities.json" ]]; then
+    local dest_json="$dest/config/device-identities.json"
+    local src_json_size dest_json_size
+    src_json_size=$(wc -c < "$SOURCE_DIR/config/device-identities.json" 2>/dev/null || echo 0)
+    dest_json_size=$(wc -c < "$dest_json" 2>/dev/null || echo 0)
+    # 只在來源有內容且目標為空（{}）或不存在時才覆寫；避免更新模式蓋掉現場設定
+    if [[ "$src_json_size" -gt 3 && "$dest_json_size" -le 3 ]]; then
+      safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
+      log "已從來源同步 config/device-identities.json"
+    fi
+  fi
   if [[ -f "$SOURCE_DIR/dpm-ctl.sh" ]]; then
     safe_cp "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
     chmod +x "$dest/dpm-ctl.sh"
@@ -1510,7 +1522,7 @@ validate_runtime_config() {
   [[ -f "$dest/index.js" ]] || die "找不到 $dest/index.js"
   [[ -f "$dest/.env" ]] || die "找不到 $dest/.env"
   [[ -f "$dest/config/device-identities.json" ]] || \
-    die "找不到 $dest/config/device-identities.json（請依現場 SLAVE_ID 填寫 guid / component_type）"
+    die "找不到 $dest/config/device-identities.json（請依現場 SLAVE_ID 填寫 guid）"
 
   if [[ ! -e "${SERIAL_PORT:-/dev/ttyUSB0}" ]]; then
     # shellcheck disable=SC1090
@@ -1541,7 +1553,7 @@ try {
 }
 const missing = slaveIds.filter((id) => {
   const row = ident[String(id)];
-  return !row || !row.guid || !row.component_type;
+  return !row || !row.guid;
 });
 if (missing.length) {
   console.error(

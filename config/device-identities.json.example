@@ -1,10 +1,5 @@
 {
   "1": {
-    "guid": "{7593C12A-D8A4-4E05-98DE-E67FA846DC74}",
-    "component_type": "buses"
-  },
-  "2": {
-    "guid": "{11111111-2222-3333-4444-555555555555}",
-    "component_type": "utilities"
+    "guid": "{7593C12A-D8A4-4E05-98DE-E67FA846DC74}"
   }
 }
