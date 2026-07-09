@@ -1335,24 +1335,37 @@ sync_app_files() {
       safe_cp "$SOURCE_DIR/dpm-collector.service" "$dest/lib/dpm-collector.service"
   fi
   [[ -f "$SOURCE_DIR/.env.example" ]] && safe_cp "$SOURCE_DIR/.env.example" "$dest/.env.example"
+  # device-identities.json.example 僅供參考，始終同步
   if [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
     safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
-    if [[ ! -f "$dest/config/device-identities.json" ]]; then
-      safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json"
-      log "已從範本建立 config/device-identities.json（請依現場修改）"
-    fi
   fi
-  # 若來源端有手動建立的 device-identities.json（非 .example），同步到安裝目錄
+  # 從來源同步 device-identities.json（優先取正式檔，無則從 .example 建立）
+  local dest_json="$dest/config/device-identities.json"
   if [[ -f "$SOURCE_DIR/config/device-identities.json" ]]; then
-    local dest_json="$dest/config/device-identities.json"
-    local src_json_size dest_json_size
+    local src_json_size
     src_json_size=$(wc -c < "$SOURCE_DIR/config/device-identities.json" 2>/dev/null || echo 0)
-    dest_json_size=$(wc -c < "$dest_json" 2>/dev/null || echo 0)
-    # 只在來源有內容且目標為空（{}）或不存在時才覆寫；避免更新模式蓋掉現場設定
-    if [[ "$src_json_size" -gt 3 && "$dest_json_size" -le 3 ]]; then
-      safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
-      log "已從來源同步 config/device-identities.json"
+    if [[ "$src_json_size" -gt 3 ]]; then
+      # 來源有正式內容的 device-identities.json
+      if [[ ! -f "$dest_json" ]]; then
+        # 目標不存在 → 直接複製
+        safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
+        log "已從來源同步 config/device-identities.json"
+      elif cmp -s "$SOURCE_DIR/config/device-identities.json" "$dest_json" 2>/dev/null; then
+        : # 內容相同，無需動作
+      else
+        # 目標已存在且內容不同 → 詢問使用者
+        if [[ -t 0 ]] && prompt_yes_no "來源 config/device-identities.json 與安裝目錄不同，是否覆寫？" "n"; then
+          safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
+          log "已覆寫 config/device-identities.json"
+        else
+          log "保留安裝目錄原有的 config/device-identities.json（與來源不同）"
+        fi
+      fi
     fi
+  elif [[ ! -f "$dest_json" ]] && [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
+    # 來源無正式檔，但目標也不存在 → 從 .example 建立
+    safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest_json"
+    log "已從範本建立 config/device-identities.json（請依現場修改）"
   fi
   if [[ -f "$SOURCE_DIR/dpm-ctl.sh" ]]; then
     safe_cp "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
