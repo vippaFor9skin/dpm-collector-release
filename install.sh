@@ -31,6 +31,7 @@ DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-dpm_user}"
 DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
 DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-5000}"
 DEFAULT_MONITOR_ONLY="${DEFAULT_MONITOR_ONLY:-0}"
+DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyS1}"
 
 # 判斷「腳本所在目錄」對應的套件根目錄（支援就地 git clone 安裝）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1056,44 +1057,39 @@ prompt_yes_no() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
-# --- Modbus 序列埠偵測（僅 ttyUSB* / ttyACM* / by-id；不含滑鼠鍵盤） ---
+# --- Modbus 序列埠偵測（板載 RS-485；BL118 等閘道無 USB Serial 驅動） ---
+# BLIIOT 慣例：485A-1/485B-1 → /dev/ttyS1；其餘通道為 ttyS2/ttyS5/… 或 ttyWCH*
 detect_serial_ports() {
-  local p link real pattern
-  {
-    for link in /dev/serial/by-id/*; do
-      [[ -e "$link" ]] || continue
-      real="$(readlink -f "$link" 2>/dev/null || continue)"
-      [[ -c "$real" ]] && printf '%s\n' "$real"
-    done
-    for pattern in /dev/ttyUSB* /dev/ttyACM*; do
-      for p in $pattern; do
-        [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
-      done
-    done
-  } | sort -u
+  local p n
+  # 優先列板載 RS-485-1（ttyS1），再列其他硬體 UART；不含 ttyUSB*/ttyACM*
+  for n in 1 2 3 4 5 6 7 8 9 0; do
+    p="/dev/ttyS${n}"
+    [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
+  done
+  for p in /dev/ttyWCH* /dev/ttyAS* /dev/ttyRS485*; do
+    [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
+  done
 }
 
 serial_port_desc() {
-  local dev="$1" real link base props
-  real="$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")"
-  for link in /dev/serial/by-id/*; do
-    [[ -e "$link" ]] || continue
-    if [[ "$(readlink -f "$link" 2>/dev/null)" == "$real" ]]; then
-      base="$(basename "$link")"
-      printf '%s' "$base"
-      return 0
-    fi
-  done
-  if command -v udevadm >/dev/null 2>&1; then
-    props="$(udevadm info -q property -n "$dev" 2>/dev/null \
-      | awk -F= '/^ID_VENDOR=/ {v=$2} /^ID_MODEL=/ {m=$2} END {if (v||m) printf "%s %s", v, m}')"
-    [[ -n "$props" ]] && printf '%s' "$props"
-  fi
+  local dev="$1" base
+  base="$(basename "$dev")"
+  case "$base" in
+    ttyS1) printf '%s' "板載 RS485-1（485A-1 / 485B-1）" ;;
+    ttyS2) printf '%s' "板載 RS485-2（485A-2 / 485B-2）" ;;
+    ttyS3) printf '%s' "板載 RS485-3" ;;
+    ttyS4) printf '%s' "板載 RS485-4" ;;
+    ttyS5) printf '%s' "板載 RS485-3／擴充通道（視 X 板）" ;;
+    ttyS0) printf '%s' "板載 UART／RS485（視機型）" ;;
+    ttyWCH*) printf '%s' "擴充板 RS485（Y 板）" ;;
+    ttyAS*|ttyRS485*) printf '%s' "板載 RS485" ;;
+    *) printf '%s' "硬體序列埠" ;;
+  esac
 }
 
 prompt_serial_port() {
   local -a ports=()
-  local line i choice desc manual_idx default_choice default_manual="/dev/ttyUSB0"
+  local line i choice desc manual_idx default_choice default_manual="$DEFAULT_SERIAL_PORT"
 
   while IFS= read -r line; do
     [[ -n "$line" ]] && ports+=("$line")
@@ -1101,9 +1097,9 @@ prompt_serial_port() {
 
   manual_idx=$((${#ports[@]} + 1))
 
-  echo "請選擇 Modbus 序列埠（RS-485／USB 轉串口；滑鼠、鍵盤、網卡不在此列）：" >&2
+  echo "請選擇 Modbus 序列埠（板載 RS-485 端子）：" >&2
   if [[ ${#ports[@]} -eq 0 ]]; then
-    echo "  （目前未偵測到 /dev/ttyUSB* 或 /dev/ttyACM*）" >&2
+    echo "  （目前未偵測到 /dev/ttyS*／ttyWCH*／ttyAS* 等板載 RS-485 節點）" >&2
   else
     for i in "${!ports[@]}"; do
       desc="$(serial_port_desc "${ports[$i]}")"
@@ -1176,8 +1172,7 @@ write_env_file_content() {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 序列埠（RS-485 轉 USB）
-# Linux 常見為 /dev/ttyUSB0 或 /dev/ttyACM0
+# 序列埠（板載 RS-485；BL118：485A-1/485B-1 → /dev/ttyS1）
 # ---------------------------------------------------------------------------
 SERIAL_PORT=$serial_port
 MODBUS_BAUD_RATE=9600
@@ -1641,15 +1636,15 @@ validate_runtime_config() {
   [[ -f "$dest/config/device-identities.json" ]] || \
     die "找不到 $dest/config/device-identities.json（請依現場 SLAVE_ID 填寫 guid）"
 
-  if [[ ! -e "${SERIAL_PORT:-/dev/ttyUSB0}" ]]; then
+  if [[ ! -e "${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}" ]]; then
     # shellcheck disable=SC1090
     set -a
     # shellcheck source=/dev/null
     source "$dest/.env"
     set +a
   fi
-  if [[ ! -e "${SERIAL_PORT:-/dev/ttyUSB0}" ]]; then
-    log "⚠️  序列埠 ${SERIAL_PORT:-/dev/ttyUSB0} 尚不存在（未接 RS-485 時服務可能無法啟動）"
+  if [[ ! -e "${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}" ]]; then
+    log "⚠️  序列埠 ${SERIAL_PORT:-$DEFAULT_SERIAL_PORT} 尚不存在（板載 RS-485 節點未就緒時服務可能無法啟動）"
   fi
 
   if ! (

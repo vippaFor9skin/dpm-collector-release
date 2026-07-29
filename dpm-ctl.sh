@@ -226,7 +226,7 @@ cmd_test_modbus() {
   node -e "
 require('dotenv').config({ path: '.env' });
 const ModbusRTU = require('modbus-serial');
-const port = process.env.SERIAL_PORT || '/dev/ttyUSB0';
+const port = process.env.SERIAL_PORT || '/dev/ttyS1';
 const baud = parseInt(process.env.MODBUS_BAUD_RATE || '9600', 10);
 const slaveRaw = (process.env.MODBUS_SLAVE_IDS || '1').split(',')[0].trim();
 const slaveId = parseInt(slaveRaw, 10);

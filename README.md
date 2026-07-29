@@ -7,7 +7,7 @@
 ## 安裝前準備
 
 - Ubuntu 20.04 以上（64-bit 完整支援；ARMv7/armhf 使用 SQLite-only 相容模式）
-- RS-485 轉 USB 已接上（安裝時會列出序列埠讓你選）
+- 板載 RS-485 已接到電表（BL118：485A-1/485B-1 → `/dev/ttyS1`；安裝時會列出板載序列埠讓你選）
 - 向後台取得：**Gateway ID**、**MQTT 密碼**
 - 編輯 `config/device-identities.json`（可先複製 `.example`），填入各台設備的 GUID
 
@@ -49,7 +49,7 @@ sudo ./dpm-ctl.sh update      # 拉新版本並更新
 |------|--------|
 | 服務起不來 | `sudo ./dpm-ctl.sh check-config` |
 | MQTT 連不上 | 確認 `.env` 的 `MQTT_PASSWORD`；`sudo ./dpm-ctl.sh test-mqtt` |
-| Modbus 讀不到 | 確認 USB 線與站號；`sudo ./dpm-ctl.sh test-modbus` |
+| Modbus 讀不到 | 確認板載 485A/B 接線與站號；`sudo ./dpm-ctl.sh test-modbus` |
 
 ---
 
