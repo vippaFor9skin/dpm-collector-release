@@ -23,6 +23,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/dpm-collector}"
 SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
 SERVICE_USER="${SERVICE_USER:-dpm}"
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
+NODE_ARMV7_MAJOR="${NODE_ARMV7_MAJOR:-22}"
 INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
 CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
 DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://124.219.96.34:1883}"
@@ -143,7 +144,18 @@ detect_system() {
   fi
 }
 
-# --- Node.js（採集程式執行環境，預設 24+） ---
+# --- 平台能力 ---
+is_armv7() {
+  local arch
+  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  [[ "$arch" == "armhf" || "$arch" == "armv7l" ]]
+}
+
+influx_required_for_platform() {
+  ! is_armv7
+}
+
+# --- Node.js（一般平台 24+；ARMv7 使用仍提供官方 binary 的 22.x） ---
 node_major() {
   if ! command -v node >/dev/null 2>&1; then
     echo 0
@@ -152,23 +164,73 @@ node_major() {
   node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1
 }
 
+required_node_major() {
+  if is_armv7; then
+    echo "$NODE_ARMV7_MAJOR"
+  else
+    echo "$NODE_MIN_MAJOR"
+  fi
+}
+
+install_nodejs_armv7() {
+  local major="$NODE_ARMV7_MAJOR"
+  local base_url="https://nodejs.org/dist/latest-v${major}.x"
+  local tmp_dir sums_file archive archive_path install_root version_dir
+
+  log "ARMv7 不受 NodeSource 支援，改裝 Node.js 官方 ${major}.x ARMv7 binary …"
+  apt-get install -y ca-certificates curl xz-utils
+  tmp_dir="$(mktemp -d)"
+  sums_file="$tmp_dir/SHASUMS256.txt"
+  curl -fsSL "$base_url/SHASUMS256.txt" -o "$sums_file"
+  archive="$(awk -v major="$major" \
+    '$2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-linux-armv7l\\.tar\\.xz$") { print $2; exit }' \
+    "$sums_file")"
+  [[ -n "$archive" ]] || {
+    rm -rf "$tmp_dir"
+    die "Node.js ${major}.x 官方下載區找不到 ARMv7 binary"
+  }
+  archive_path="$tmp_dir/$archive"
+  curl -fL "$base_url/$archive" -o "$archive_path"
+  (cd "$tmp_dir" && grep "  $archive\$" SHASUMS256.txt | sha256sum -c -)
+
+  install_root="/usr/local/lib/nodejs"
+  version_dir="${archive%.tar.xz}"
+  mkdir -p "$install_root"
+  rm -rf "$install_root/$version_dir"
+  tar -xJf "$archive_path" -C "$install_root"
+  ln -sfn "$install_root/$version_dir/bin/node" /usr/local/bin/node
+  ln -sfn "$install_root/$version_dir/bin/npm" /usr/local/bin/npm
+  ln -sfn "$install_root/$version_dir/bin/npx" /usr/local/bin/npx
+  [[ -e "$install_root/$version_dir/bin/corepack" ]] && \
+    ln -sfn "$install_root/$version_dir/bin/corepack" /usr/local/bin/corepack
+  rm -rf "$tmp_dir"
+  hash -r
+}
+
 install_nodejs() {
-  log "安裝 Node.js ${NODE_MIN_MAJOR}+ …"
+  local required_major
+  required_major="$(required_node_major)"
+  log "安裝 Node.js ${required_major}+ …"
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y ca-certificates curl gnupg
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x" | bash -
-    apt-get install -y nodejs
+    if is_armv7; then
+      install_nodejs_armv7
+    else
+      curl -fsSL "https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x" | bash -
+      apt-get install -y nodejs
+    fi
   else
-    die "不支援的套件管理器，請手動安裝 Node.js ${NODE_MIN_MAJOR}+"
+    die "不支援的套件管理器，請手動安裝 Node.js ${required_major}+"
   fi
   log "Node.js 版本：$(node -v)"
 }
 
 ensure_nodejs() {
-  local major
+  local major required_major
   major="$(node_major)"
-  if [[ "$major" -lt "$NODE_MIN_MAJOR" ]]; then
+  required_major="$(required_node_major)"
+  if [[ "$major" -lt "$required_major" ]]; then
     install_nodejs
   else
     log "Node.js 已安裝：$(node -v)"
@@ -926,6 +988,10 @@ EOF
 }
 
 verify_influxdb_ready() {
+  if ! influx_required_for_platform; then
+    log "ARMv7：略過 InfluxDB 2 檢查（官方不支援 32-bit ARM，使用 SQLite 佇列）"
+    return
+  fi
   if ! systemctl is-active --quiet influxdb 2>/dev/null; then
     die "InfluxDB 服務未運行（本地緩存必填）"
   fi
@@ -1096,6 +1162,12 @@ write_env_file_content() {
   local mqtt_user="${10}"
   local mqtt_pass="${11}"
   local gateway_id="${12}"
+  local influx_required=1
+  local influx_url="http://127.0.0.1:8086"
+  if ! influx_required_for_platform; then
+    influx_required=0
+    influx_url=""
+  fi
 
   cat > "$env_file" <<EOF
 # ---------------------------------------------------------------------------
@@ -1143,10 +1215,11 @@ SQLITE_OUTBOX_PATH=data/dpm.db
 OUTBOX_FLUSH_BATCH=200
 
 # ---------------------------------------------------------------------------
-# InfluxDB 2（必填）：本地 7 天緩存；僅監聽 127.0.0.1:8086
+# InfluxDB 2：64-bit 平台必填；ARMv7 因官方不支援而停用
 # Token 由 install.sh 建立；管理資訊備份見 /root/dpm-collector-influx-admin.txt
 # ---------------------------------------------------------------------------
-INFLUX_URL=http://127.0.0.1:8086
+INFLUX_REQUIRED=$influx_required
+INFLUX_URL=$influx_url
 INFLUX_TOKEN=$influx_token
 INFLUX_ORG=$influx_org
 INFLUX_BUCKET=$influx_bucket
@@ -1213,21 +1286,29 @@ write_env_file() {
     log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
   fi
 
-  log_section "InfluxDB"
-  setup_result="$(ensure_influxdb_for_install)"
-  IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
-  influx_org="$(trim_value "$influx_org")"
-  influx_bucket="$(trim_value "$influx_bucket")"
-  influx_token="$(trim_value "$influx_token")"
-  [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
-    || die "InfluxDB 設定不完整（org/bucket/token）"
+  if influx_required_for_platform; then
+    log_section "InfluxDB"
+    setup_result="$(ensure_influxdb_for_install)"
+    IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
+    influx_org="$(trim_value "$influx_org")"
+    influx_bucket="$(trim_value "$influx_bucket")"
+    influx_token="$(trim_value "$influx_token")"
+    [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
+      || die "InfluxDB 設定不完整（org/bucket/token）"
+  else
+    log_section "本地儲存"
+    log "⚠️  ARMv7/armhf 不支援 InfluxDB 2；改用 SQLite MQTT 永續佇列"
+    influx_org=""
+    influx_bucket=""
+    influx_token=""
+  fi
 
   write_env_file_content "$env_file" \
     "$serial_port" "$slave_ids" "$monitor_only" "$poll_ms" \
     "$influx_org" "$influx_bucket" "$influx_token" \
     "$mqtt_url" "$mqtt_user" "$mqtt_pass" "$gateway_id"
   chmod 600 "$env_file"
-  log "✅ 已建立 $env_file（含 MQTT、Modbus、InfluxDB 設定）"
+  log "✅ 已建立 $env_file（含 MQTT、Modbus 與本地儲存設定）"
 }
 
 env_file_is_complete() {
@@ -1239,7 +1320,9 @@ env_file_is_complete() {
   source "$env_file"
   set +a
   [[ -n "${GATEWAY_ID:-}" ]] || return 1
-  [[ -n "${INFLUX_URL:-}" && -n "${INFLUX_TOKEN:-}" && -n "${INFLUX_ORG:-}" && -n "${INFLUX_BUCKET:-}" ]] || return 1
+  if [[ "${INFLUX_REQUIRED:-1}" != 0 ]]; then
+    [[ -n "${INFLUX_URL:-}" && -n "${INFLUX_TOKEN:-}" && -n "${INFLUX_ORG:-}" && -n "${INFLUX_BUCKET:-}" ]] || return 1
+  fi
   [[ -n "${MODBUS_SLAVE_IDS:-}" ]] || return 1
   [[ -n "${SERIAL_PORT:-}" ]] || return 1
   return 0
@@ -1298,6 +1381,16 @@ ensure_env_file() {
   # shellcheck source=/dev/null
   source "$env_file"
   set +a
+  if ! influx_required_for_platform; then
+    if [[ "${INFLUX_REQUIRED:-1}" != 0 ]]; then
+      sed -i '/^INFLUX_REQUIRED=/d' "$env_file"
+      printf '\n# ARMv7 不支援 InfluxDB 2，使用 SQLite MQTT 永續佇列\nINFLUX_REQUIRED=0\n' >> "$env_file"
+    fi
+    if env_file_is_complete "$env_file"; then
+      log "保留既有 .env，ARMv7 已設定為 SQLite-only"
+      return
+    fi
+  fi
   if [[ -n "${GATEWAY_ID:-}" && -n "${MODBUS_SLAVE_IDS:-}" && -n "${SERIAL_PORT:-}" ]] \
     && [[ -z "${INFLUX_TOKEN:-}" || -z "${INFLUX_ORG:-}" || -z "${INFLUX_BUCKET:-}" ]]; then
     log "⚠️  既有 .env 缺少 InfluxDB 設定，自動補齊 …"
@@ -1307,6 +1400,17 @@ ensure_env_file() {
 
   log "⚠️  既有 .env 不完整，重新建立 …"
   write_env_file "$env_file"
+}
+
+ensure_armv7_env_mode() {
+  local env_file="$1"
+  is_armv7 || return
+  [[ -f "$env_file" ]] || return
+  if ! grep -q '^INFLUX_REQUIRED=0$' "$env_file"; then
+    sed -i '/^INFLUX_REQUIRED=/d' "$env_file"
+    printf '\n# ARMv7 不支援 InfluxDB 2，使用 SQLite MQTT 永續佇列\nINFLUX_REQUIRED=0\n' >> "$env_file"
+    log "ARMv7：已將既有 .env 切換為 SQLite-only"
+  fi
 }
 
 # 將 SOURCE_DIR 白名單檔案複製到 INSTALL_DIR；就地安裝時 safe_cp 會跳過同路徑。
@@ -1578,7 +1682,7 @@ if (missing.length) {
 }
 const influxKeys = ['INFLUX_URL', 'INFLUX_TOKEN', 'INFLUX_ORG', 'INFLUX_BUCKET'];
 const missingInflux = influxKeys.filter((k) => !String(process.env[k] || '').trim());
-if (missingInflux.length) {
+if (String(process.env.INFLUX_REQUIRED || '1') !== '0' && missingInflux.length) {
   console.error('❌ .env 缺少 InfluxDB 設定:', missingInflux.join(', '));
   console.error('   請重新執行 install.sh，或手動填入 INFLUX_TOKEN');
   process.exit(1);
@@ -1641,7 +1745,9 @@ main() {
     sync_app_files "$INSTALL_DIR"
     link_git_from_source "$INSTALL_DIR"
     log_section "Node.js"
+    ensure_nodejs
     install_dependencies "$INSTALL_DIR"
+    ensure_armv7_env_mode "$INSTALL_DIR/.env"
     verify_influxdb_ready
     validate_runtime_config "$INSTALL_DIR"
     fix_permissions
@@ -1661,6 +1767,7 @@ main() {
   install_dependencies "$INSTALL_DIR"
 
   ensure_env_file "$INSTALL_DIR/.env"
+  ensure_armv7_env_mode "$INSTALL_DIR/.env"
 
   log_section "systemd"
   ensure_service_user

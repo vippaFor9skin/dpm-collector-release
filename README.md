@@ -6,7 +6,7 @@
 
 ## 安裝前準備
 
-- Ubuntu 20.04 以上（64-bit）
+- Ubuntu 20.04 以上（64-bit 完整支援；ARMv7/armhf 使用 SQLite-only 相容模式）
 - RS-485 轉 USB 已接上（安裝時會列出序列埠讓你選）
 - 向後台取得：**Gateway ID**、**MQTT 密碼**
 - 編輯 `config/device-identities.json`（可先複製 `.example`），填入各台設備的 GUID
@@ -23,6 +23,8 @@ sudo ./install.sh
 
 依畫面輸入 Gateway ID、序列埠、Modbus 站號、MQTT 密碼即可。  
 腳本會自動安裝 Node.js、InfluxDB（本機 7 天備份）並啟動服務。
+ARMv7/armhf 上會安裝 Node.js 22 並略過不支援 32-bit ARM 的 InfluxDB 2；
+未送達 MQTT 的資料仍由 SQLite 佇列保存，但不提供 Influx 7 天歷史。
 
 ---
 
