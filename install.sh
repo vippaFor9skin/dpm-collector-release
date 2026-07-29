@@ -1059,15 +1059,47 @@ prompt_yes_no() {
 
 # --- Modbus 序列埠偵測（板載 RS-485；BL118 等閘道無 USB Serial 驅動） ---
 # BLIIOT 慣例：485A-1/485B-1 → /dev/ttyS1；其餘通道為 ttyS2/ttyS5/… 或 ttyWCH*
+serial_port_usable() {
+  local dev="$1"
+  local baud="${2:-9600}"
+  [[ -c "$dev" ]] || return 1
+  command -v stty >/dev/null 2>&1 || return 1
+  stty -F "$dev" "$baud" cs8 -parenb cstopb >/dev/null 2>&1
+}
+
+validate_serial_port_or_die() {
+  local dev="$1"
+  local baud="${2:-9600}"
+  local error
+  [[ -c "$dev" ]] || die "RS-485 序列埠不存在或不是字元裝置：$dev"
+  command -v stty >/dev/null 2>&1 || die "找不到 stty，無法驗證 RS-485 序列埠"
+  if ! error="$(stty -F "$dev" "$baud" cs8 -parenb cstopb 2>&1)"; then
+    log "RS-485 序列埠驗證失敗：$dev（${baud} baud, 8N2）"
+    [[ -n "$error" ]] && log "$error"
+    die "核心驅動無法設定 $dev；請確認 BL118 實體 RS-485 通道對應的 /dev/ttyS*"
+  fi
+  log "✅ RS-485 序列埠可用：$dev（${baud} baud, 8N2）"
+}
+
 detect_serial_ports() {
   local p n
-  # 優先列板載 RS-485-1（ttyS1），再列其他硬體 UART；不含 ttyUSB*/ttyACM*
+  # 優先測板載 RS-485-1（ttyS1），只列出核心可成功設定 9600 8N2 的 UART。
   for n in 1 2 3 4 5 6 7 8 9 0; do
     p="/dev/ttyS${n}"
-    [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
+    [[ -e "$p" && -c "$p" ]] || continue
+    if serial_port_usable "$p"; then
+      printf '%s\n' "$p"
+    else
+      log "略過 $p：核心驅動無法設定 9600 baud"
+    fi
   done
   for p in /dev/ttyWCH* /dev/ttyAS* /dev/ttyRS485*; do
-    [[ -e "$p" && -c "$p" ]] && printf '%s\n' "$p"
+    [[ -e "$p" && -c "$p" ]] || continue
+    if serial_port_usable "$p"; then
+      printf '%s\n' "$p"
+    else
+      log "略過 $p：核心驅動無法設定 9600 baud"
+    fi
   done
 }
 
@@ -1097,9 +1129,9 @@ prompt_serial_port() {
 
   manual_idx=$((${#ports[@]} + 1))
 
-  echo "請選擇 Modbus 序列埠（板載 RS-485 端子）：" >&2
+  echo "請選擇 Modbus 序列埠（僅列出已通過 9600 baud 核心測試的板載 RS-485）：" >&2
   if [[ ${#ports[@]} -eq 0 ]]; then
-    echo "  （目前未偵測到 /dev/ttyS*／ttyWCH*／ttyAS* 等板載 RS-485 節點）" >&2
+    echo "  （未找到可設定 9600 baud 的板載 RS-485；可手動輸入其他裝置節點驗證）" >&2
   else
     for i in "${!ports[@]}"; do
       desc="$(serial_port_desc "${ports[$i]}")"
@@ -1142,6 +1174,36 @@ prompt_serial_port() {
   else
     prompt "請輸入序列埠路徑" "$default_manual"
   fi
+}
+
+ensure_serial_port_config() {
+  local env_file="$1"
+  local configured baud selected
+  [[ -f "$env_file" ]] || return
+
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+  configured="${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}"
+  baud="${MODBUS_BAUD_RATE:-9600}"
+  if serial_port_usable "$configured" "$baud"; then
+    log "RS-485 序列埠已驗證：$configured（${baud} baud）"
+    return
+  fi
+
+  log "⚠️  既有 SERIAL_PORT=$configured 無法由核心設定 ${baud} baud，請重新選擇板載 RS-485"
+  selected="$(prompt_serial_port)"
+  validate_serial_port_or_die "$selected" "$baud"
+  if grep -q '^SERIAL_PORT=' "$env_file"; then
+    sed -i "s|^SERIAL_PORT=.*|SERIAL_PORT=$selected|" "$env_file"
+  else
+    printf '\nSERIAL_PORT=%s\n' "$selected" >> "$env_file"
+  fi
+  SERIAL_PORT="$selected"
+  export SERIAL_PORT
+  log "✅ 已更新 $env_file：SERIAL_PORT=$selected"
 }
 
 # 寫入含中文備註的 .env（欄位說明對照開發倉 .env.example）。
@@ -1271,6 +1333,7 @@ write_env_file() {
 
   log_section "Modbus"
   serial_port="$(prompt_serial_port)"
+  validate_serial_port_or_die "$serial_port" 9600
   slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
   slave_ids="${slave_ids//[\[\]]/}"
 
@@ -1631,21 +1694,20 @@ is_update_mode() {
 # 啟動服務前以 Node 腳本驗證：slave id 與 device-identities 一致、Influx 四項齊全。
 validate_runtime_config() {
   local dest="$1"
+  local serial_port baud_rate
   [[ -f "$dest/index.js" ]] || die "找不到 $dest/index.js"
   [[ -f "$dest/.env" ]] || die "找不到 $dest/.env"
   [[ -f "$dest/config/device-identities.json" ]] || \
     die "找不到 $dest/config/device-identities.json（請依現場 SLAVE_ID 填寫 guid）"
 
-  if [[ ! -e "${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    # shellcheck source=/dev/null
-    source "$dest/.env"
-    set +a
-  fi
-  if [[ ! -e "${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}" ]]; then
-    log "⚠️  序列埠 ${SERIAL_PORT:-$DEFAULT_SERIAL_PORT} 尚不存在（板載 RS-485 節點未就緒時服務可能無法啟動）"
-  fi
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  source "$dest/.env"
+  set +a
+  serial_port="${SERIAL_PORT:-$DEFAULT_SERIAL_PORT}"
+  baud_rate="${MODBUS_BAUD_RATE:-9600}"
+  validate_serial_port_or_die "$serial_port" "$baud_rate"
 
   if ! (
     cd "$dest"
@@ -1743,6 +1805,7 @@ main() {
     ensure_nodejs
     install_dependencies "$INSTALL_DIR"
     ensure_armv7_env_mode "$INSTALL_DIR/.env"
+    ensure_serial_port_config "$INSTALL_DIR/.env"
     verify_influxdb_ready
     validate_runtime_config "$INSTALL_DIR"
     fix_permissions
