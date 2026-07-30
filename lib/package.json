@@ -2,7 +2,7 @@
   "name": "dpm-collector",
   "version": "1.0.0",
   "private": true,
-  "description": "Modbus RTU collector for Delta DPM-DA510/530 via MQTT",
+  "description": "Modbus RTU collector for Delta DPM-DA530 (DPM-DA510) on BLIIOT BL118 via MQTT",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -11,10 +11,8 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@influxdata/influxdb-client": "^1.33.0",
     "dotenv": "^16.4.5",
     "modbus-serial": "^8.0.19",
-    "mqtt": "^5.10.4",
-    "sql.js": "^1.11.0"
+    "mqtt": "^5.10.4"
   }
 }

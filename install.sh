@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — DPM-DA510/530 Modbus RTU Collector 一鍵安裝／更新
+# install.sh — DPM-DA530（DPM-DA510）Modbus RTU Collector 一鍵安裝／更新（BL118）
 #
-# 目標平台：BL118 等 Ubuntu 20.04+ 邊緣閘道器。
+# 目標平台：僅限 BLIIOT BL118 工業閘道器（ARMv7），搭配 DPM-DA530（DPM-DA510）電表，
+# 現場實測 Pin 1 / Pin 2 對應 /dev/ttyAS4。
 # 執行方式：sudo ./install.sh（須 root，用於 apt、systemd、chown）。
 #
 # 安裝來源（自動偵測 SOURCE_DIR）：
-#   - 客戶 repo 根目錄（git clone / USB 的 dpm-collector/）
+#   - 客戶 repo 根目錄（git clone 的 dpm-collector/）
 #   - 開發 repo 的 scripts/ 或含 dist/ 的舊布局
 #
 # 主要流程（初次安裝）：
 #   環境檢查 → 同步檔案 → Node.js + npm ci → 互動建立 .env
-#   → InfluxDB 2（本地 7 天緩存）→ systemd → 權限 → 啟動服務
+#   （GATEWAY_ID、Modbus、MQTT）→ systemd → 權限 → 啟動服務
+#
+# 本地持久化：SQLite 7 天備援（已送標記、逾期刪除；斷網未送列恢復後補送）。
 #
 # 更新模式（is_update_mode）：已有 .env 且 systemd 單元存在時，
 #   保留 .env，僅同步程式、npm ci、驗證、重啟。
@@ -24,14 +27,15 @@ SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
 SERVICE_USER="${SERVICE_USER:-dpm}"
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
 NODE_ARMV7_MAJOR="${NODE_ARMV7_MAJOR:-22}"
-INFLUX_RETENTION_HOURS="${INFLUX_RETENTION_HOURS:-168}"
 CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
 DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://124.219.96.34:1883}"
 DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-dpm_user}"
 DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
-DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-5000}"
+DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-60000}"
+DEFAULT_SQLITE_RETENTION_HOURS="${DEFAULT_SQLITE_RETENTION_HOURS:-168}"
 DEFAULT_MONITOR_ONLY="${DEFAULT_MONITOR_ONLY:-0}"
-DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyS1}"
+DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyAS4}"
+MAX_MODBUS_DEVICES="${MAX_MODBUS_DEVICES:-5}"
 
 # 判斷「腳本所在目錄」對應的套件根目錄（支援就地 git clone 安裝）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,6 +110,16 @@ safe_cp() {
   cp -f "$src" "$dst"
 }
 
+# 複製本身不做字元轉碼；以 iconv 驗證中文設定檔仍是合法 UTF-8。
+validate_utf8_file() {
+  local file="$1"
+  [[ -f "$file" ]] || die "找不到 UTF-8 檢查目標：$file"
+  if command -v iconv >/dev/null 2>&1; then
+    iconv -f UTF-8 -t UTF-8 "$file" >/dev/null 2>&1 || \
+      die "$file 不是合法 UTF-8，已停止以免中文備註寫成亂碼"
+  fi
+}
+
 # 客戶 repo 已改為根目錄 index.js + lib/；此函式相容舊 dist/ 與根目錄 package.json。
 migrate_legacy_dist_layout() {
   local root="$1"
@@ -150,10 +164,6 @@ is_armv7() {
   local arch
   arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
   [[ "$arch" == "armhf" || "$arch" == "armv7l" ]]
-}
-
-influx_required_for_platform() {
-  ! is_armv7
 }
 
 # --- Node.js（一般平台 24+；ARMv7 使用仍提供官方 binary 的 22.x） ---
@@ -238,676 +248,6 @@ ensure_nodejs() {
   fi
 }
 
-# --- InfluxDB 2（本地時序緩存，斷網期間仍保存採樣） ---
-# INFLUX_HOST：influx CLI 與 curl 共用；勿用 influx --host（部分版本不支援）。
-# 健康檢查優先 curl /health，避免 sudo 下 PATH 缺 curl 導致誤判。
-install_influxdb_apt() {
-  log "安裝 InfluxDB 2（apt）…"
-  apt-get update -qq
-  apt-get install -y wget gpg ca-certificates
-  local key_file
-  key_file="$(mktemp)"
-  wget -qO "$key_file" https://repos.influxdata.com/influxdata-archive.key
-  gpg --show-keys --with-fingerprint --with-colons "$key_file" 2>&1 \
-    | grep -qE ':24C975CBA61A024EE1B631787C3D57159FC2F927:' \
-    || die "InfluxData GPG 指紋驗證失敗"
-  gpg --dearmor < "$key_file" > /etc/apt/trusted.gpg.d/influxdata-archive.gpg
-  rm -f "$key_file"
-  echo "deb [signed-by=/etc/apt/trusted.gpg.d/influxdata-archive.gpg] https://repos.influxdata.com/debian stable main" \
-    > /etc/apt/sources.list.d/influxdata.list
-  apt-get update -qq
-  apt-get install -y influxdb2
-  systemctl enable --now influxdb
-  log "InfluxDB 服務已啟動"
-}
-
-INFLUX_HOST="${INFLUX_HOST:-http://127.0.0.1:8086}"
-
-find_http_client() {
-  local name="$1"
-  local c
-  for c in "/usr/bin/$name" "/bin/$name"; do
-    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
-  done
-  command -v "$name" 2>/dev/null || true
-}
-
-ensure_influx_http_client() {
-  find_http_client curl >/dev/null && return 0
-  find_http_client wget >/dev/null && return 0
-  apt-get update -qq
-  apt-get install -y curl
-}
-
-influx_cli() {
-  INFLUX_HOST="$INFLUX_HOST" influx "$@"
-}
-
-influx_http_healthy() {
-  local curl_bin wget_bin body
-  curl_bin="$(find_http_client curl)"
-  if [[ -n "$curl_bin" ]]; then
-    body="$("$curl_bin" -sf "${INFLUX_HOST}/health" 2>/dev/null || true)"
-    if [[ -n "$body" ]] && echo "$body" | grep -q '"pass"'; then
-      return 0
-    fi
-  fi
-  wget_bin="$(find_http_client wget)"
-  if [[ -n "$wget_bin" ]]; then
-    body="$("$wget_bin" -qO- "${INFLUX_HOST}/health" 2>/dev/null || true)"
-    if [[ -n "$body" ]] && echo "$body" | grep -q '"pass"'; then
-      return 0
-    fi
-  fi
-  return 1
-}
-
-influx_reachable() {
-  if influx_http_healthy; then
-    return 0
-  fi
-  INFLUX_HOST="$INFLUX_HOST" influx ping >/dev/null 2>&1
-}
-
-log_influx_reachability_debug() {
-  local curl_bin body ping_out
-  curl_bin="$(find_http_client curl)"
-  log "除錯：INFLUX_HOST=$INFLUX_HOST PATH=$PATH"
-  log "除錯：curl=${curl_bin:-（找不到，請 apt install curl）}"
-  if [[ -n "$curl_bin" ]]; then
-    body="$("$curl_bin" -sf "${INFLUX_HOST}/health" 2>&1 || true)"
-    log "除錯：GET ${INFLUX_HOST}/health → ${body:-（空）}"
-  fi
-  ping_out="$(INFLUX_HOST="$INFLUX_HOST" influx ping 2>&1 | head -c 160 || true)"
-  log "除錯：INFLUX_HOST=$INFLUX_HOST influx ping → ${ping_out:-（空）}"
-}
-
-influx_is_initialized() {
-  influx_cli ping >/dev/null 2>&1 && influx_cli org list >/dev/null 2>&1
-}
-
-fetch_influx_setup_status() {
-  local curl_bin wget_bin body=""
-  curl_bin="$(find_http_client curl)"
-  if [[ -n "$curl_bin" ]]; then
-    body="$("$curl_bin" -sf "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
-  else
-    wget_bin="$(find_http_client wget)"
-    [[ -n "$wget_bin" ]] && body="$("$wget_bin" -qO- "${INFLUX_HOST}/api/v2/setup" 2>/dev/null || true)"
-  fi
-  printf '%s' "$body"
-}
-
-influx_server_needs_setup() {
-  ensure_influx_http_client
-  local body
-  body="$(fetch_influx_setup_status)"
-  if [[ -n "$body" ]]; then
-    if echo "$body" | grep -qE '"allowed"[[:space:]]*:[[:space:]]*true'; then
-      return 0
-    fi
-    return 1
-  fi
-  # Influx 已在跑但讀不到 setup API：視為已初始化，不要 rerun setup
-  if influx_reachable; then
-    log "InfluxDB 已在運行，略過 setup（改為建立 API Token）"
-    return 1
-  fi
-  return 0
-}
-
-wait_for_influx_ping() {
-  ensure_influx_http_client
-  local i
-  for i in $(seq 1 20); do
-    if influx_reachable; then
-      return 0
-    fi
-    sleep 1
-  done
-  log_influx_reachability_debug
-  return 1
-}
-
-resolve_influx_credentials() {
-  local _var="$1"
-  local created="$2"
-  local admin_file="/root/dpm-collector-influx-admin.txt"
-  local influx_org influx_bucket influx_token
-
-  if [[ -n "$created" ]]; then
-    IFS='|' read -r influx_org influx_bucket influx_token <<< "$created"
-    printf -v "$_var" '%s|%s|%s' "$influx_org" "$influx_bucket" "$influx_token"
-    return 0
-  fi
-
-  [[ -f "$admin_file" ]] || return 1
-  influx_token="$(trim_value "$(sed -n 's/^Token:[[:space:]]*//p' "$admin_file" | head -n1)")"
-  influx_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
-  influx_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
-  [[ -n "$influx_token" ]] || return 1
-  [[ -n "$influx_org" ]] || influx_org="${INFLUX_ORG:-nineskin}"
-  [[ -n "$influx_bucket" ]] || influx_bucket="${INFLUX_BUCKET:-9998-6_dpm}"
-  log "沿用 $admin_file 內 Token"
-  printf -v "$_var" '%s|%s|%s' "$influx_org" "$influx_bucket" "$influx_token"
-}
-
-# Influx 已初始化時，sudo 執行者（SUDO_USER）的 influx CLI 常有有效 token，
-# 但 root 自己沒有 ~/.influxdbv2/configs；以下函式以 SUDO_USER 身份跑 influx。
-influx_sudo_user() {
-  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    printf '%s' "$SUDO_USER"
-  fi
-}
-
-influx_invoke_as_user() {
-  local user="$1"
-  shift
-  if [[ -n "$user" ]]; then
-    sudo -u "$user" env INFLUX_HOST="$INFLUX_HOST" "$@"
-  else
-    env INFLUX_HOST="$INFLUX_HOST" "$@"
-  fi
-}
-
-influx_cli_user_can_list_orgs() {
-  local user="$1"
-  influx_invoke_as_user "$user" influx org list --hide-headers >/dev/null 2>&1
-}
-
-influx_token_can_list_orgs() {
-  local token="$1"
-  [[ -n "$token" ]] || return 1
-  INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$token" influx org list --hide-headers >/dev/null 2>&1
-}
-
-extract_active_token_from_influx_config_json() {
-  node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const j=JSON.parse(s);
-    const list=Array.isArray(j)
-      ? j
-      : (j.configs
-        ? Object.entries(j.configs).map(([name, c]) => ({ name, ...c }))
-        : Object.entries(j).filter(([, c]) => c && typeof c === 'object').map(([name, c]) => ({ name, ...c })));
-    const active=list.find((c)=>c.active===true||c.active==='true')||list[0];
-    if(active&&active.token) process.stdout.write(String(active.token));
-  } catch {}
-});
-"
-}
-
-get_influx_cli_token_for_user() {
-  local user="$1" raw
-  raw="$(influx_invoke_as_user "$user" influx config list --json 2>/dev/null || true)"
-  [[ -n "$raw" ]] || return 1
-  trim_value "$(printf '%s' "$raw" | extract_active_token_from_influx_config_json)"
-}
-
-detect_influx_org_with_cli_user() {
-  local user="$1"
-  local preferred="$2"
-  local detected
-  detected="$(influx_invoke_as_user "$user" influx org list --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((o)=>o.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-detect_influx_bucket_with_cli_user() {
-  local user="$1"
-  local org="$2"
-  local preferred="$3"
-  local detected
-  detected="$(influx_invoke_as_user "$user" influx bucket list --org "$org" --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((b)=>b.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-collect_influx_tokens_from_configs_file() {
-  local configs_file="$1"
-  [[ -f "$configs_file" ]] || return 0
-  node - "$configs_file" <<'NODE'
-const fs = require('fs');
-const path = process.argv[2];
-try {
-  const j = JSON.parse(fs.readFileSync(path, 'utf8'));
-  const configs = j.configs || j;
-  const list = Array.isArray(configs)
-    ? configs
-    : Object.entries(configs).map(([name, c]) => ({ name, ...c }));
-  for (const c of list) {
-    if (c && c.token) process.stdout.write(String(c.token) + '\n');
-  }
-} catch {}
-NODE
-}
-
-collect_influx_tokens_from_user() {
-  local user="$1" home cf
-  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
-  [[ -n "$home" ]] || return 0
-  for cf in "$home/.influxdbv2/configs" "$home/.config/influxdb/influx-configs"; do
-    collect_influx_tokens_from_configs_file "$cf"
-  done
-}
-
-collect_all_influx_config_tokens() {
-  local raw token sudo_user
-  sudo_user="$(influx_sudo_user || true)"
-
-  raw="$(influx config list --json 2>/dev/null || true)"
-  if [[ -n "$raw" ]]; then
-    token="$(printf '%s' "$raw" | extract_active_token_from_influx_config_json || true)"
-    [[ -n "$token" ]] && printf '%s\n' "$token"
-    printf '%s' "$raw" | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const j=JSON.parse(s);
-    const list=Array.isArray(j)?j:(j.configs?Object.entries(j.configs).map(([n,c])=>({name:n,...c})):[]);
-    for (const c of list) { if(c&&c.token) process.stdout.write(String(c.token)+'\n'); }
-  } catch {}
-});
-"
-  fi
-
-  if [[ -n "$sudo_user" ]]; then
-    token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
-    [[ -n "$token" ]] && printf '%s\n' "$token"
-    collect_influx_tokens_from_user "$sudo_user"
-  fi
-}
-
-find_influx_operator_token() {
-  local token sudo_user
-  sudo_user="$(influx_sudo_user || true)"
-
-  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
-    token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
-    if [[ -n "$token" ]] && influx_token_can_list_orgs "$token"; then
-      printf '%s' "$token"
-      return 0
-    fi
-  fi
-
-  while IFS= read -r token; do
-    token="$(trim_value "$token")"
-    [[ -n "$token" ]] || continue
-    if influx_token_can_list_orgs "$token"; then
-      printf '%s' "$token"
-      return 0
-    fi
-  done < <(collect_all_influx_config_tokens | sort -u)
-  return 1
-}
-
-detect_influx_org_with_token() {
-  local op_token="$1"
-  local preferred="$2"
-  local detected
-  detected="$(INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$op_token" influx org list --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((o)=>o.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-detect_influx_bucket_with_token() {
-  local op_token="$1"
-  local org="$2"
-  local preferred="$3"
-  local detected
-  detected="$(INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$op_token" influx bucket list --org "$org" --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((b)=>b.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-get_active_influx_token() {
-  local raw
-  raw="$(influx config list --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const j=JSON.parse(s);
-    const list=Array.isArray(j)?j:(j.configs?Object.entries(j.configs).map(([n,c])=>({name:n,...c})):[]);
-    const active=list.find((c)=>c.active===true||c.active==='true')||list[0];
-    if(active&&active.token) process.stdout.write(String(active.token));
-  } catch {}
-});
-" 2>/dev/null || true)"
-  trim_value "$raw"
-}
-
-detect_influx_org() {
-  local preferred="$1"
-  local detected
-  detected="$(influx_cli org list --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((o)=>o.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-detect_influx_bucket() {
-  local org="$1"
-  local preferred="$2"
-  local detected
-  detected="$(influx_cli bucket list --org "$org" --hide-headers --json 2>/dev/null | node -e "
-let s='';
-process.stdin.on('data',(d)=>s+=d);
-process.stdin.on('end',()=>{
-  try {
-    const arr=JSON.parse(s);
-    const names=(Array.isArray(arr)?arr:[]).map((b)=>b.name).filter(Boolean);
-    const pref=process.argv[1];
-    if(names.includes(pref)){ process.stdout.write(pref); return; }
-    if(names[0]) process.stdout.write(names[0]);
-  } catch {}
-});
-" "$preferred" 2>/dev/null || true)"
-  detected="$(trim_value "$detected")"
-  [[ -n "$detected" ]] && printf '%s' "$detected" || printf '%s' "$preferred"
-}
-
-save_influx_admin_token() {
-  local admin_file="$1"
-  local org="$2"
-  local bucket="$3"
-  local token="$4"
-  if [[ -f "$admin_file" ]]; then
-    if grep -q '^Token:' "$admin_file"; then
-      sed -i "s|^Token:.*|Token: $token|" "$admin_file"
-    else
-      printf '\nToken: %s\n' "$token" >> "$admin_file"
-    fi
-    if grep -q '^Org:' "$admin_file"; then
-      sed -i "s|^Org:.*|Org: $org|" "$admin_file"
-    fi
-    if grep -q '^Bucket:' "$admin_file"; then
-      sed -i "s|^Bucket:.*|Bucket: $bucket|" "$admin_file"
-    fi
-  else
-    cat > "$admin_file" <<EOF
-InfluxDB 管理資訊（請妥善保存，勿提交 git）
-Org: $org
-Bucket: $bucket
-Token: $token
-Retention: ${INFLUX_RETENTION_HOURS}h
-EOF
-  fi
-  chmod 600 "$admin_file"
-}
-
-influx_auth_create_token() {
-  local org="$1"
-  local bucket="$2"
-  local token="$3"
-  local desc="$4"
-  local op_token="${5:-}"
-  local err_log rc sudo_user
-
-  err_log="$(mktemp)"
-  sudo_user="$(influx_sudo_user || true)"
-  [[ -n "$op_token" ]] || op_token="$(find_influx_operator_token || true)"
-
-  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
-    if influx_invoke_as_user "$sudo_user" influx auth create \
-      --org "$org" \
-      --token "$token" \
-      --description "$desc" \
-      --read-bucket "$bucket" \
-      --write-bucket "$bucket" 2>"$err_log"; then
-      rm -f "$err_log"
-      return 0
-    fi
-    log "以 $sudo_user 建立 Token 失敗：$(tr '\n' ' ' < "$err_log" | head -c 200)"
-    : >"$err_log"
-  fi
-
-  if [[ -n "$op_token" ]]; then
-    if INFLUX_HOST="$INFLUX_HOST" INFLUX_TOKEN="$op_token" influx auth create \
-      --org "$org" \
-      --token "$token" \
-      --description "$desc" \
-      --read-bucket "$bucket" \
-      --write-bucket "$bucket" 2>"$err_log"; then
-      rm -f "$err_log"
-      return 0
-    fi
-  fi
-
-  if influx_cli auth create \
-    --org "$org" \
-    --token "$token" \
-    --description "$desc" \
-    --read-bucket "$bucket" \
-    --write-bucket "$bucket" 2>"$err_log"; then
-    rm -f "$err_log"
-    return 0
-  fi
-
-  rc=$?
-  log "influx auth create 失敗（exit $rc）：$(tr '\n' ' ' < "$err_log" | head -c 240)"
-  rm -f "$err_log"
-  return 1
-}
-
-influx_setup_force_rebind() {
-  local username="$1"
-  local password="$2"
-  local org="$3"
-  local bucket="$4"
-  local token="$5"
-  influx_cli setup \
-    --username "$username" \
-    --password "$password" \
-    --org "$org" \
-    --bucket "$bucket" \
-    --retention "${INFLUX_RETENTION_HOURS}h" \
-    --token "$token" \
-    --force
-}
-
-# 在已初始化的 Influx 上建立採集專用 token；失敗時嘗試沿用 SUDO_USER 的 CLI token。
-create_collector_influx_token() {
-  local org="$1"
-  local bucket="$2"
-  local token desc admin_file op_token sudo_user
-  admin_file="/root/dpm-collector-influx-admin.txt"
-  token="$(openssl rand -hex 32)"
-  desc="dpm-collector-$(date +%Y%m%d%H%M%S)"
-  sudo_user="$(influx_sudo_user || true)"
-
-  if [[ -n "$sudo_user" ]] && influx_cli_user_can_list_orgs "$sudo_user"; then
-    org="$(detect_influx_org_with_cli_user "$sudo_user" "$org")"
-    bucket="$(detect_influx_bucket_with_cli_user "$sudo_user" "$org" "$bucket")"
-    log "Influx 已存在：org=$org bucket=$bucket（自 $sudo_user 的 influx CLI 偵測）"
-    if influx_auth_create_token "$org" "$bucket" "$token" "$desc"; then
-      save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
-      printf '%s|%s|%s' "$org" "$bucket" "$token"
-      return 0
-    fi
-    op_token="$(get_influx_cli_token_for_user "$sudo_user" || true)"
-    if [[ -n "$op_token" ]] && influx_token_can_list_orgs "$op_token"; then
-      log "⚠️  無法建立獨立 Token，沿用 $sudo_user 的 Influx CLI Token"
-      save_influx_admin_token "$admin_file" "$org" "$bucket" "$op_token"
-      printf '%s|%s|%s' "$org" "$bucket" "$op_token"
-      return 0
-    fi
-  fi
-
-  op_token="$(find_influx_operator_token || true)"
-  if [[ -n "$op_token" ]]; then
-    org="$(detect_influx_org_with_token "$op_token" "$org")"
-    bucket="$(detect_influx_bucket_with_token "$op_token" "$org" "$bucket")"
-    log "Influx 已存在：org=$org bucket=$bucket（自本機 influx CLI 偵測）"
-    if influx_auth_create_token "$org" "$bucket" "$token" "$desc" "$op_token"; then
-      save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
-      printf '%s|%s|%s' "$org" "$bucket" "$token"
-      return 0
-    fi
-    log "⚠️  無法建立獨立 Token，沿用已驗證的 Influx CLI Token"
-    save_influx_admin_token "$admin_file" "$org" "$bucket" "$op_token"
-    printf '%s|%s|%s' "$org" "$bucket" "$op_token"
-    return 0
-  fi
-
-  if [[ -f "$admin_file" ]]; then
-    local admin_user admin_pass file_org file_bucket
-    admin_user="$(sed -n 's/^Username:[[:space:]]*//p' "$admin_file" | head -n1)"
-    admin_pass="$(sed -n 's/^Password:[[:space:]]*//p' "$admin_file" | head -n1)"
-    file_org="$(sed -n 's/^Org:[[:space:]]*//p' "$admin_file" | head -n1)"
-    file_bucket="$(sed -n 's/^Bucket:[[:space:]]*//p' "$admin_file" | head -n1)"
-    [[ -n "$file_org" ]] && org="$file_org"
-    [[ -n "$file_bucket" ]] && bucket="$file_bucket"
-    if [[ -n "$admin_user" && -n "$admin_pass" ]]; then
-      log "改用 influx setup --force 重新綁定 CLI 並建立 Token …"
-      if influx_setup_force_rebind "$admin_user" "$admin_pass" "$org" "$bucket" "$token"; then
-        save_influx_admin_token "$admin_file" "$org" "$bucket" "$token"
-        printf '%s|%s|%s' "$org" "$bucket" "$token"
-        return 0
-      fi
-    fi
-  fi
-
-  if [[ -f "$INSTALL_DIR/.env" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    # shellcheck source=/dev/null
-    source "$INSTALL_DIR/.env"
-    set +a
-    if [[ -n "${INFLUX_TOKEN:-}" ]] && influx_token_can_list_orgs "$(trim_value "$INFLUX_TOKEN")"; then
-      org="$(detect_influx_org_with_token "$(trim_value "$INFLUX_TOKEN")" "${INFLUX_ORG:-$org}")"
-      bucket="$(detect_influx_bucket_with_token "$(trim_value "$INFLUX_TOKEN")" "$org" "${INFLUX_BUCKET:-$bucket}")"
-      log "沿用 $INSTALL_DIR/.env 內 Influx Token"
-      save_influx_admin_token "$admin_file" "$org" "$bucket" "$(trim_value "$INFLUX_TOKEN")"
-      printf '%s|%s|%s' "$org" "$bucket" "$(trim_value "$INFLUX_TOKEN")"
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-init_influxdb() {
-  local username="${1:-dpmadmin}"
-  local password="${2:-}"
-  local org="${3:-nineskin}"
-  local bucket="${4:-9998-6_dpm}"
-  local token err_log
-  token="$(openssl rand -hex 32)"
-  err_log="$(mktemp)"
-
-  log "初始化 InfluxDB（org=$org, bucket=$bucket, retention=${INFLUX_RETENTION_HOURS}h）…"
-  if ! influx_cli setup \
-    --username "$username" \
-    --password "$password" \
-    --org "$org" \
-    --bucket "$bucket" \
-    --retention "${INFLUX_RETENTION_HOURS}h" \
-    --token "$token" \
-    --force 2>"$err_log"; then
-    log "influx setup 失敗：$(tr '\n' ' ' < "$err_log" | head -c 240)"
-    rm -f "$err_log"
-    return 1
-  fi
-  rm -f "$err_log"
-  echo "$org|$bucket|$token"
-  return 0
-}
-
-configure_influxdb_localhost() {
-  local cfg
-  for cfg in /etc/influxdb2/config.toml /etc/influxdb/config.toml; do
-    [[ -f "$cfg" ]] || continue
-    if grep -qE '^[[:space:]]*http-bind-address[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8086"' "$cfg"; then
-      log "InfluxDB 已綁定 127.0.0.1:8086"
-      return 0
-    fi
-    if grep -qE '^[[:space:]]*#?[[:space:]]*http-bind-address' "$cfg"; then
-      sed -i -E 's|^[[:space:]]*#?[[:space:]]*http-bind-address.*|http-bind-address = "127.0.0.1:8086"|' "$cfg"
-    else
-      printf '\nhttp-bind-address = "127.0.0.1:8086"\n' >> "$cfg"
-    fi
-    systemctl restart influxdb
-    sleep 2
-    log "InfluxDB 僅監聽本機 127.0.0.1:8086"
-    return 0
-  done
-  log "⚠️  未找到 InfluxDB config.toml，請確認僅本機可連"
-}
-
-log_influx_credentials() {
-  local org="$1"
-  local bucket="$2"
-  local token="$3"
-  log "INFLUX_URL=${INFLUX_HOST}"
-  log "INFLUX_ORG=$org"
-  log "INFLUX_BUCKET=$bucket"
-  log "INFLUX_TOKEN=$token"
-}
-
 log_mqtt_defaults() {
   local mqtt_url="$1"
   local mqtt_user="$2"
@@ -917,89 +257,6 @@ log_mqtt_defaults() {
   log "MQTT_USERNAME=$mqtt_user"
   log "MONITOR_ONLY=$monitor_only"
   log "POLL_INTERVAL_MS=$poll_ms"
-}
-
-# 回傳 org|bucket|token（InfluxDB 為必填，供本地 7 天緩存）
-ensure_influxdb_for_install() {
-  local influx_org="${INFLUX_ORG:-nineskin}"
-  local influx_bucket="${INFLUX_BUCKET:-9998-6_dpm}"
-  local influx_token=""
-  local admin_file="/root/dpm-collector-influx-admin.txt"
-
-  log "InfluxDB 2 為必填（本地 7 天緩存 + 斷網期間資料安全）…"
-
-  if ! dpkg -l influxdb2 >/dev/null 2>&1; then
-    install_influxdb_apt
-  elif ! systemctl is-active --quiet influxdb 2>/dev/null; then
-    systemctl enable --now influxdb || install_influxdb_apt
-  fi
-
-  configure_influxdb_localhost
-  wait_for_influx_ping || die "InfluxDB 服務未就緒（${INFLUX_HOST}）"
-
-  if influx_server_needs_setup; then
-    local influx_pass setup_result created creds
-    influx_pass="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
-    if setup_result="$(init_influxdb "dpmadmin" "$influx_pass" "$influx_org" "$influx_bucket")"; then
-      IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
-      cat > "$admin_file" <<EOF
-InfluxDB 管理帳號（請妥善保存，勿提交 git）
-Username: dpmadmin
-Password: $influx_pass
-Org: $influx_org
-Bucket: $influx_bucket
-Token: $influx_token
-Retention: ${INFLUX_RETENTION_HOURS}h
-EOF
-      chmod 600 "$admin_file"
-      log "InfluxDB 管理帳號已寫入 $admin_file"
-    else
-      log "InfluxDB 伺服器已初始化，改為建立採集程式 API Token …"
-      created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
-      resolve_influx_credentials creds "$created" || \
-        die "無法建立 InfluxDB Token。請確認 sudo 執行者（${SUDO_USER:-root}）曾 influx setup，或執行：sudo -u ${SUDO_USER:-$USER} influx org list"
-      IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
-    fi
-  elif [[ -f "$INSTALL_DIR/.env" ]]; then
-    # shellcheck disable=SC1090
-    source "$INSTALL_DIR/.env"
-    influx_org="${INFLUX_ORG:-$influx_org}"
-    influx_bucket="${INFLUX_BUCKET:-$influx_bucket}"
-    influx_token="$(trim_value "${INFLUX_TOKEN:-}")"
-    if [[ -z "$influx_token" ]]; then
-      die "InfluxDB 已初始化但 .env 缺少 INFLUX_TOKEN，請手動填入或重建 token"
-    fi
-    log "沿用既有 InfluxDB 設定"
-  else
-    log "InfluxDB 已初始化，自動建立採集程式 API Token …"
-    local created creds
-    created="$(create_collector_influx_token "$influx_org" "$influx_bucket" || true)"
-    resolve_influx_credentials creds "$created" || \
-      die "無法建立 InfluxDB Token。請確認 sudo 執行者（${SUDO_USER:-root}）曾 influx setup，或執行：sudo -u ${SUDO_USER:-$USER} influx org list"
-    IFS='|' read -r influx_org influx_bucket influx_token <<< "$creds"
-  fi
-
-  influx_token="$(trim_value "$influx_token")"
-  [[ -n "$influx_token" ]] || die "INFLUX_TOKEN 不可為空"
-
-  wait_for_influx_ping || die "InfluxDB 無法連線（${INFLUX_HOST}）"
-
-  log_influx_credentials "$influx_org" "$influx_bucket" "$influx_token"
-  echo "$influx_org|$influx_bucket|$influx_token"
-}
-
-verify_influxdb_ready() {
-  if ! influx_required_for_platform; then
-    log "ARMv7：略過 InfluxDB 2 檢查（官方不支援 32-bit ARM，使用 SQLite 佇列）"
-    return
-  fi
-  if ! systemctl is-active --quiet influxdb 2>/dev/null; then
-    die "InfluxDB 服務未運行（本地緩存必填）"
-  fi
-  if ! influx_reachable; then
-    log_influx_reachability_debug
-    die "InfluxDB 無法連線；請檢查 systemctl status influxdb 與 curl ${INFLUX_HOST}/health"
-  fi
 }
 
 # --- 互動式輸入與 .env 值格式化 ---
@@ -1057,8 +314,66 @@ prompt_yes_no() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
-# --- Modbus 序列埠偵測（板載 RS-485；BL118 等閘道無 USB Serial 驅動） ---
-# BLIIOT 慣例：485A-1/485B-1 → /dev/ttyS1；其餘通道為 ttyS2/ttyS5/… 或 ttyWCH*
+# 先問串接電表台數（1~MAX_MODBUS_DEVICES），再問站號與序列埠。
+prompt_device_count() {
+  local raw count
+  while true; do
+    raw="$(prompt "串接電表台數（1~${MAX_MODBUS_DEVICES}）" "1")"
+    raw="$(trim_value "$raw")"
+    if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
+      count=$((raw))
+      if (( count >= 1 && count <= MAX_MODBUS_DEVICES )); then
+        echo "$count"
+        return 0
+      fi
+    fi
+    log "⚠️  請輸入 1~${MAX_MODBUS_DEVICES} 的整數"
+  done
+}
+
+# 依台數產生預設站號（1,2,…,N），並驗證數量一致、無重複。
+prompt_slave_ids() {
+  local count="$1"
+  local i default="" raw cleaned
+  local -a ids=()
+  local -a parts=()
+  local -a uniq=()
+  for ((i = 1; i <= count; i++)); do
+    [[ -n "$default" ]] && default+=","
+    default+="$i"
+  done
+  while true; do
+    raw="$(prompt "Modbus Slave IDs（逗號分隔，須剛好 ${count} 個，且與 config/device-identities.json 一致）" "$default")"
+    raw="${raw//[\[\]]/}"
+    raw="$(trim_value "$raw")"
+    ids=()
+    IFS=',' read -ra parts <<< "$raw"
+    for part in "${parts[@]}"; do
+      part="$(trim_value "$part")"
+      [[ -z "$part" ]] && continue
+      if [[ ! "$part" =~ ^[1-9][0-9]*$ ]] || (( part < 1 || part > 247 )); then
+        ids=()
+        break
+      fi
+      ids+=("$part")
+    done
+    if ((${#ids[@]} != count)); then
+      log "⚠️  站號數量須為 ${count} 個（目前 ${#ids[@]}）"
+      continue
+    fi
+    cleaned="$(printf '%s\n' "${ids[@]}" | awk '!a[$0]++' | paste -sd, -)"
+    IFS=',' read -ra uniq <<< "$cleaned"
+    if ((${#uniq[@]} != count)); then
+      log "⚠️  Slave ID 不可重複"
+      continue
+    fi
+    echo "$cleaned"
+    return 0
+  done
+}
+
+# --- Modbus 序列埠偵測（BL118 板載 RS-485，僅 /dev/ttyS*／ttyWCH* 等硬體節點） ---
+# 本案 BL118 現場實測：Pin 1 / Pin 2 → /dev/ttyAS4。
 serial_port_usable() {
   local dev="$1"
   local baud="${2:-9600}"
@@ -1083,7 +398,7 @@ validate_serial_port_or_die() {
 
 detect_serial_ports() {
   local p n
-  # 優先測板載 RS-485-1（ttyS1），只列出核心可成功設定 9600 8N2 的 UART。
+  # 列出核心可成功設定 9600 8N2 的 UART；預設選 /dev/ttyAS4。
   for n in 1 2 3 4 5 6 7 8 9 0; do
     p="/dev/ttyS${n}"
     [[ -e "$p" && -c "$p" ]] || continue
@@ -1107,7 +422,8 @@ serial_port_desc() {
   local dev="$1" base
   base="$(basename "$dev")"
   case "$base" in
-    ttyS1) printf '%s' "板載 RS485-1（485A-1 / 485B-1）" ;;
+    ttyAS4) printf '%s' "BL118 Pin 1 / Pin 2（現場實測）" ;;
+    ttyS1) printf '%s' "板載 RS485（依機型）" ;;
     ttyS2) printf '%s' "板載 RS485-2（485A-2 / 485B-2）" ;;
     ttyS3) printf '%s' "板載 RS485-3" ;;
     ttyS4) printf '%s' "板載 RS485-4" ;;
@@ -1213,35 +529,27 @@ write_env_file_content() {
   local slave_ids="$3"
   local monitor_only="$4"
   local poll_ms="$5"
-  local influx_org="$6"
-  local influx_bucket="$7"
-  local influx_token="$8"
-  local mqtt_url="$9"
-  local mqtt_user="${10}"
-  local mqtt_pass="${11}"
-  local gateway_id="${12}"
-  local influx_required=1
-  local influx_url="http://127.0.0.1:8086"
-  if ! influx_required_for_platform; then
-    influx_required=0
-    influx_url=""
-  fi
+  local mqtt_url="$6"
+  local mqtt_user="$7"
+  local mqtt_pass="$8"
+  local gateway_id="$9"
 
-  cat > "$env_file" <<EOF
+  local env_tmp="${env_file}.tmp.$$"
+  cat > "$env_tmp" <<EOF
 # ---------------------------------------------------------------------------
 # 本檔由 install.sh 產生（$(date -Iseconds)）
 # 修改後請執行：sudo systemctl restart dpm-collector
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 序列埠（板載 RS-485；BL118：485A-1/485B-1 → /dev/ttyS1）
+# 序列埠（BL118 現場實測：Pin 1 / Pin 2 → /dev/ttyAS4）
 # ---------------------------------------------------------------------------
 SERIAL_PORT=$serial_port
 MODBUS_BAUD_RATE=9600
 MODBUS_DATA_BITS=8
 MODBUS_STOP_BITS=2
 MODBUS_PARITY=none
-# 多設備輪詢（最多 10 台，逗號分隔；須與 config/device-identities.json 的 key 一致）
+# 多設備輪詢（最多 5 台，逗號分隔；同一 SERIAL_PORT 串接；須與 config/device-identities.json 的 key 一致）
 MODBUS_SLAVE_IDS=$slave_ids
 MODBUS_TIMEOUT_MS=1000
 
@@ -1251,7 +559,7 @@ MODBUS_TIMEOUT_MS=1000
 TIMEZONE=Asia/Taipei
 
 # ---------------------------------------------------------------------------
-# 僅本機檢測：1 時不連 MQTT，仍寫 SQLite + Influx；改回 0 重啟後可補送佇列
+# 僅本機檢測：1 時不連 MQTT，仍寫入 SQLite 本地備援；改回 0 重啟後可補送未送筆
 # ---------------------------------------------------------------------------
 MONITOR_ONLY=$monitor_only
 
@@ -1262,27 +570,15 @@ MODBUS_FLOAT_SWAP_WORDS=0
 
 # 設備身分對照（JSON；key 為 slave_id）；請先編輯再 install
 DEVICE_IDENTITIES_FILE=config/device-identities.json
-# 輪詢間隔（毫秒）；第一次讀取也在間隔後才執行
+# 輪詢間隔（毫秒）；BL118 建議 ≥60000（5 台約可撐 7 天本地備援）
 POLL_INTERVAL_MS=$poll_ms
 
 # ---------------------------------------------------------------------------
-# MQTT 永續佇列（SQLite）；斷網累積、恢復後補送
+# 本地 SQLite 備援：保留 7 天；已 MQTT 成功標記後不重送；逾期刪除
 # ---------------------------------------------------------------------------
 SQLITE_OUTBOX_PATH=data/dpm.db
+SQLITE_RETENTION_HOURS=${DEFAULT_SQLITE_RETENTION_HOURS}
 OUTBOX_FLUSH_BATCH=200
-
-# ---------------------------------------------------------------------------
-# InfluxDB 2：64-bit 平台必填；ARMv7 因官方不支援而停用
-# Token 由 install.sh 建立；管理資訊備份見 /root/dpm-collector-influx-admin.txt
-# ---------------------------------------------------------------------------
-INFLUX_REQUIRED=$influx_required
-INFLUX_URL=$influx_url
-INFLUX_TOKEN=$influx_token
-INFLUX_ORG=$influx_org
-INFLUX_BUCKET=$influx_bucket
-INFLUX_MEASUREMENT=dpm
-INFLUX_WRITE_TIMEOUT_MS=20000
-INFLUX_SOURCE_TAG=dpm
 
 # ---------------------------------------------------------------------------
 # MQTT（MONITOR_ONLY=0 時必填）
@@ -1311,17 +607,19 @@ MQTT_CONNECT_TIMEOUT_MS=30000
 # mqtts:// 自簽憑證測試用；正式環境請保持 0
 MQTT_TLS_INSECURE=0
 EOF
+  validate_utf8_file "$env_tmp"
+  mv -f "$env_tmp" "$env_file"
+  validate_utf8_file "$env_file"
 }
 
-# 互動建立 .env：GATEWAY_ID → Modbus → MQTT → InfluxDB。
+# 互動建立 .env：GATEWAY_ID → Modbus → MQTT。
 # log_section 標題僅影響終端顯示，不寫入 .env。
 write_env_file() {
   local env_file="$1"
   log_section "設定檔"
   log "建立 $env_file …"
 
-  local gateway_id serial_port slave_ids
-  local influx_org influx_bucket influx_token setup_result
+  local gateway_id serial_port slave_ids device_count
   local mqtt_url="$DEFAULT_MQTT_URL"
   local mqtt_user="$DEFAULT_MQTT_USERNAME"
   local mqtt_pass="$DEFAULT_MQTT_PASSWORD"
@@ -1332,10 +630,11 @@ write_env_file() {
   [[ -n "$gateway_id" ]] || die "GATEWAY_ID 不可為空"
 
   log_section "Modbus"
+  log "電表採 RS-485 串接：同一 SERIAL_PORT 輪詢多站號（最多 ${MAX_MODBUS_DEVICES} 台）"
+  device_count="$(prompt_device_count)"
+  slave_ids="$(prompt_slave_ids "$device_count")"
   serial_port="$(prompt_serial_port)"
   validate_serial_port_or_die "$serial_port" 9600
-  slave_ids="$(prompt "Modbus Slave IDs（逗號分隔，須與 config/device-identities.json 一致）" "1,2")"
-  slave_ids="${slave_ids//[\[\]]/}"
 
   log_section "MQTT"
   log_mqtt_defaults "$mqtt_url" "$mqtt_user" "$monitor_only" "$poll_ms"
@@ -1344,26 +643,8 @@ write_env_file() {
     log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
   fi
 
-  if influx_required_for_platform; then
-    log_section "InfluxDB"
-    setup_result="$(ensure_influxdb_for_install)"
-    IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
-    influx_org="$(trim_value "$influx_org")"
-    influx_bucket="$(trim_value "$influx_bucket")"
-    influx_token="$(trim_value "$influx_token")"
-    [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
-      || die "InfluxDB 設定不完整（org/bucket/token）"
-  else
-    log_section "本地儲存"
-    log "⚠️  ARMv7/armhf 不支援 InfluxDB 2；改用 SQLite MQTT 永續佇列"
-    influx_org=""
-    influx_bucket=""
-    influx_token=""
-  fi
-
   write_env_file_content "$env_file" \
     "$serial_port" "$slave_ids" "$monitor_only" "$poll_ms" \
-    "$influx_org" "$influx_bucket" "$influx_token" \
     "$mqtt_url" "$mqtt_user" "$mqtt_pass" "$gateway_id"
   chmod 600 "$env_file"
   log "✅ 已建立 $env_file（含 MQTT、Modbus 與本地儲存設定）"
@@ -1378,50 +659,12 @@ env_file_is_complete() {
   source "$env_file"
   set +a
   [[ -n "${GATEWAY_ID:-}" ]] || return 1
-  if [[ "${INFLUX_REQUIRED:-1}" != 0 ]]; then
-    [[ -n "${INFLUX_URL:-}" && -n "${INFLUX_TOKEN:-}" && -n "${INFLUX_ORG:-}" && -n "${INFLUX_BUCKET:-}" ]] || return 1
-  fi
   [[ -n "${MODBUS_SLAVE_IDS:-}" ]] || return 1
   [[ -n "${SERIAL_PORT:-}" ]] || return 1
   return 0
 }
 
-repair_env_influx() {
-  local env_file="$1"
-  local setup_result influx_org influx_bucket influx_token
-  log_section "InfluxDB"
-  log "補齊 $env_file 的 InfluxDB 設定 …"
-  setup_result="$(ensure_influxdb_for_install)"
-  IFS='|' read -r influx_org influx_bucket influx_token <<< "$setup_result"
-  influx_org="$(trim_value "$influx_org")"
-  influx_bucket="$(trim_value "$influx_bucket")"
-  influx_token="$(trim_value "$influx_token")"
-  [[ -n "$influx_org" && -n "$influx_bucket" && -n "$influx_token" ]] \
-    || die "InfluxDB 設定不完整（org/bucket/token）"
-
-  for key in INFLUX_URL INFLUX_TOKEN INFLUX_ORG INFLUX_BUCKET INFLUX_MEASUREMENT \
-    INFLUX_WRITE_TIMEOUT_MS INFLUX_SOURCE_TAG; do
-    sed -i "/^${key}=/d" "$env_file"
-  done
-
-  cat >> "$env_file" <<EOF
-
-# ---------------------------------------------------------------------------
-# InfluxDB 2（必填）：以下由 install.sh 補齊（$(date -Iseconds)）
-# ---------------------------------------------------------------------------
-INFLUX_URL=http://127.0.0.1:8086
-INFLUX_TOKEN=$influx_token
-INFLUX_ORG=$influx_org
-INFLUX_BUCKET=$influx_bucket
-INFLUX_MEASUREMENT=dpm
-INFLUX_WRITE_TIMEOUT_MS=20000
-INFLUX_SOURCE_TAG=dpm
-EOF
-  chmod 600 "$env_file"
-  log "✅ 已更新 $env_file 的 InfluxDB 設定"
-}
-
-# 已有 .env 時：完整則保留；缺 Influx 則補齊；否則整份重建。
+# 已有 .env 時：完整則保留；否則整份重建。
 ensure_env_file() {
   local env_file="$1"
   if [[ ! -f "$env_file" ]]; then
@@ -1434,41 +677,8 @@ ensure_env_file() {
     return
   fi
 
-  # shellcheck disable=SC1090
-  set -a
-  # shellcheck source=/dev/null
-  source "$env_file"
-  set +a
-  if ! influx_required_for_platform; then
-    if [[ "${INFLUX_REQUIRED:-1}" != 0 ]]; then
-      sed -i '/^INFLUX_REQUIRED=/d' "$env_file"
-      printf '\n# ARMv7 不支援 InfluxDB 2，使用 SQLite MQTT 永續佇列\nINFLUX_REQUIRED=0\n' >> "$env_file"
-    fi
-    if env_file_is_complete "$env_file"; then
-      log "保留既有 .env，ARMv7 已設定為 SQLite-only"
-      return
-    fi
-  fi
-  if [[ -n "${GATEWAY_ID:-}" && -n "${MODBUS_SLAVE_IDS:-}" && -n "${SERIAL_PORT:-}" ]] \
-    && [[ -z "${INFLUX_TOKEN:-}" || -z "${INFLUX_ORG:-}" || -z "${INFLUX_BUCKET:-}" ]]; then
-    log "⚠️  既有 .env 缺少 InfluxDB 設定，自動補齊 …"
-    repair_env_influx "$env_file"
-    return
-  fi
-
   log "⚠️  既有 .env 不完整，重新建立 …"
   write_env_file "$env_file"
-}
-
-ensure_armv7_env_mode() {
-  local env_file="$1"
-  is_armv7 || return
-  [[ -f "$env_file" ]] || return
-  if ! grep -q '^INFLUX_REQUIRED=0$' "$env_file"; then
-    sed -i '/^INFLUX_REQUIRED=/d' "$env_file"
-    printf '\n# ARMv7 不支援 InfluxDB 2，使用 SQLite MQTT 永續佇列\nINFLUX_REQUIRED=0\n' >> "$env_file"
-    log "ARMv7：已將既有 .env 切換為 SQLite-only"
-  fi
 }
 
 # 將 SOURCE_DIR 白名單檔案複製到 INSTALL_DIR；就地安裝時 safe_cp 會跳過同路徑。
@@ -1611,7 +821,7 @@ try {
 }
 
 # npm ci 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
-# USB / 離線包若已含 node_modules 則直接複製，跳過 npm。
+# 來源目錄若已含 node_modules（離線包）則直接複製，跳過 npm。
 install_dependencies() {
   local dest="$1"
   if [[ -d "$SOURCE_DIR/node_modules" ]] && [[ ! -d "$dest/node_modules" ]]; then
@@ -1691,7 +901,7 @@ is_update_mode() {
     && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]
 }
 
-# 啟動服務前以 Node 腳本驗證：slave id 與 device-identities 一致、Influx 四項齊全。
+# 啟動服務前以 Node 腳本驗證：slave id 與 device-identities 一致。
 validate_runtime_config() {
   local dest="$1"
   local serial_port baud_rate
@@ -1735,13 +945,6 @@ if (missing.length) {
     missing.join(',')
   );
   console.error('   請編輯 config/device-identities.json，或改 .env 的 MODBUS_SLAVE_IDS');
-  process.exit(1);
-}
-const influxKeys = ['INFLUX_URL', 'INFLUX_TOKEN', 'INFLUX_ORG', 'INFLUX_BUCKET'];
-const missingInflux = influxKeys.filter((k) => !String(process.env[k] || '').trim());
-if (String(process.env.INFLUX_REQUIRED || '1') !== '0' && missingInflux.length) {
-  console.error('❌ .env 缺少 InfluxDB 設定:', missingInflux.join(', '));
-  console.error('   請重新執行 install.sh，或手動填入 INFLUX_TOKEN');
   process.exit(1);
 }
 NODE
@@ -1791,6 +994,7 @@ finish_install_success() {
 # --- 主流程 ---
 main() {
   require_root
+  validate_utf8_file "$0"
   log_section "環境"
   detect_system
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -1804,9 +1008,7 @@ main() {
     log_section "Node.js"
     ensure_nodejs
     install_dependencies "$INSTALL_DIR"
-    ensure_armv7_env_mode "$INSTALL_DIR/.env"
     ensure_serial_port_config "$INSTALL_DIR/.env"
-    verify_influxdb_ready
     validate_runtime_config "$INSTALL_DIR"
     fix_permissions
     log_section "服務"
@@ -1825,12 +1027,10 @@ main() {
   install_dependencies "$INSTALL_DIR"
 
   ensure_env_file "$INSTALL_DIR/.env"
-  ensure_armv7_env_mode "$INSTALL_DIR/.env"
 
   log_section "systemd"
   ensure_service_user
   install_systemd_unit
-  verify_influxdb_ready
   validate_runtime_config "$INSTALL_DIR"
   fix_permissions
   log_section "服務"

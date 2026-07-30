@@ -31,7 +31,6 @@ usage() {
   enable          設定開機自啟
   disable         取消開機自啟
   check-config    檢查 .env 設定完整性
-  test-influx     測試 InfluxDB 連線
   test-mqtt       測試 MQTT 連線
   test-modbus     測試 Modbus 讀取（單次）
 EOF
@@ -94,7 +93,7 @@ cmd_update() {
       sudo git -C "$INSTALL_DIR" pull
     fi
   else
-    die "$INSTALL_DIR 不是 git 倉庫；請 git clone 客戶公開倉庫，或使用 USB 離線包安裝"
+    die "$INSTALL_DIR 不是 git 倉庫；請以 git clone 客戶公開倉庫安裝"
   fi
   if [[ -f "$INSTALL_DIR/install.sh" ]]; then
     sudo "$INSTALL_DIR/install.sh"
@@ -105,7 +104,7 @@ cmd_update() {
   fi
 }
 
-# 逐項檢查 .env 必填欄位與 device-identities.json、influxdb 服務狀態。
+# 逐項檢查 .env 必填欄位與 device-identities.json。
 cmd_check_config() {
   require_install_dir
   local env_file="$INSTALL_DIR/.env"
@@ -131,17 +130,6 @@ cmd_check_config() {
   check_nonempty SERIAL_PORT
   check_nonempty MODBUS_SLAVE_IDS
   check_nonempty GATEWAY_ID
-  check_nonempty INFLUX_URL
-  check_nonempty INFLUX_TOKEN
-  check_nonempty INFLUX_ORG
-  check_nonempty INFLUX_BUCKET
-
-  if systemctl is-active --quiet influxdb 2>/dev/null; then
-    echo "✅ influxdb 服務運行中"
-  else
-    echo "❌ influxdb 服務未運行（本地緩存必填）"
-    ok=0
-  fi
 
   if [[ "${MONITOR_ONLY:-0}" != "1" ]]; then
     check_nonempty MQTT_URL
@@ -160,41 +148,6 @@ cmd_check_config() {
   fi
 
   [[ "$ok" -eq 1 ]] && echo "✅ 設定檢查通過" || die "設定檢查未通過"
-}
-
-# 先 influx ping，再以官方 JS client 打 API（與採集程式相同依賴）。
-cmd_test_influx() {
-  require_install_dir
-  if ! systemctl is-active --quiet influxdb 2>/dev/null; then
-    die "influxdb 服務未運行"
-  fi
-  if ! command -v influx >/dev/null 2>&1; then
-    die "找不到 influx CLI"
-  fi
-  INFLUX_HOST="${INFLUX_URL:-http://127.0.0.1:8086}" influx ping \
-    || die "influx ping 失敗（可試：INFLUX_HOST=http://127.0.0.1:8086 influx ping）"
-  cd "$INSTALL_DIR"
-  node -e "
-require('dotenv').config({ path: '.env' });
-const { InfluxDB } = require('@influxdata/influxdb-client');
-const url = process.env.INFLUX_URL || '';
-const token = process.env.INFLUX_TOKEN || '';
-const org = process.env.INFLUX_ORG || '';
-const bucket = process.env.INFLUX_BUCKET || '';
-if (!url || !token || !org || !bucket) {
-  console.error('❌ INFLUX 四項未齊全');
-  process.exit(1);
-}
-const client = new InfluxDB({ url, token });
-const pingApi = client.getPingAPI();
-pingApi.getPing().then(() => {
-  console.log('✅ InfluxDB API 可連線:', url, 'bucket=' + bucket);
-  process.exit(0);
-}).catch((e) => {
-  console.error('❌ InfluxDB API 錯誤:', e.message);
-  process.exit(1);
-});
-"
 }
 
 # 單次連線測試，不發布資料；clientId 加 -test 後綴避免與正式服務衝突。
@@ -226,7 +179,7 @@ cmd_test_modbus() {
   node -e "
 require('dotenv').config({ path: '.env' });
 const ModbusRTU = require('modbus-serial');
-const port = process.env.SERIAL_PORT || '/dev/ttyS1';
+const port = process.env.SERIAL_PORT || '/dev/ttyAS4';
 const baud = parseInt(process.env.MODBUS_BAUD_RATE || '9600', 10);
 const slaveRaw = (process.env.MODBUS_SLAVE_IDS || '1').split(',')[0].trim();
 const slaveId = parseInt(slaveRaw, 10);
@@ -263,7 +216,6 @@ main() {
     enable)       systemctl enable "$SERVICE_NAME" ;;
     disable)      systemctl disable "$SERVICE_NAME" ;;
     check-config) cmd_check_config ;;
-    test-influx)  cmd_test_influx ;;
     test-mqtt)    cmd_test_mqtt ;;
     test-modbus)  cmd_test_modbus ;;
     ""|-h|--help) usage ;;

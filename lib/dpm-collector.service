@@ -1,7 +1,6 @@
 [Unit]
-Description=DPM-DA510/530 Modbus RTU Collector
-After=network.target influxdb.service
-Wants=influxdb.service
+Description=DPM-DA530 (DPM-DA510) Modbus RTU Collector (BL118)
+After=network.target
 
 [Service]
 Type=simple
@@ -9,6 +8,7 @@ User=dpm
 Group=dpm
 WorkingDirectory=/opt/dpm-collector
 EnvironmentFile=/opt/dpm-collector/.env
+Environment=NODE_OPTIONS=--experimental-sqlite
 ExecStart=/usr/bin/node /opt/dpm-collector/index.js
 Restart=always
 RestartSec=5
