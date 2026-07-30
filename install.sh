@@ -11,13 +11,13 @@
 #   - 開發 repo 的 scripts/ 或含 dist/ 的舊布局
 #
 # 主要流程（初次安裝）：
-#   環境檢查 → 同步檔案 → Node.js + npm ci → 互動建立 .env
+#   環境檢查 → 同步檔案 → Node.js + npm install → 互動建立 .env
 #   （GATEWAY_ID、Modbus、MQTT）→ systemd → 權限 → 啟動服務
 #
 # 本地持久化：SQLite 7 天備援（已送標記、逾期刪除；斷網未送列恢復後補送）。
 #
 # 更新模式（is_update_mode）：已有 .env 且 systemd 單元存在時，
-#   保留 .env，僅同步程式、npm ci、驗證、重啟。
+#   保留 .env，僅同步程式、npm install、驗證、重啟。
 # =============================================================================
 set -euo pipefail
 
@@ -820,7 +820,7 @@ try {
   fi
 }
 
-# npm ci 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
+# npm install 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
 # 來源目錄若已含 node_modules（離線包）則直接複製，跳過 npm。
 install_dependencies() {
   local dest="$1"
@@ -832,8 +832,14 @@ install_dependencies() {
   if [[ ! -f "$dest/lib/package.json" ]]; then
     die "找不到 $dest/lib/package.json（請確認為新版客戶 repo 或重新 release:client）"
   fi
-  log "執行 npm ci --omit=dev（lib/）…"
-  (cd "$dest/lib" && npm ci --omit=dev)
+  log "執行 npm install --omit=dev（lib/）…"
+  (
+    cd "$dest/lib"
+    npm install --omit=dev --no-audit --no-fund \
+      --fetch-retries=5 \
+      --fetch-retry-mintimeout=10000 \
+      --fetch-retry-maxtimeout=120000
+  )
   rm -rf "$dest/node_modules"
   mv "$dest/lib/node_modules" "$dest/node_modules"
 }
