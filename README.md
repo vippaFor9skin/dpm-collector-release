@@ -24,6 +24,14 @@ sudo ./install.sh
 依畫面輸入 Gateway ID、序列埠、Modbus 站號、MQTT 密碼即可。  
 腳本會自動安裝 Node.js、依賴，並以 systemd 啟動服務。本機 SQLite 預設保留 7 天；已成功上報 MQTT 的資料只留作備援、不會重送。
 
+安裝成功後，若 `install.sh` 是從其他暫存目錄執行，該來源專案會自動刪除；直接在 `/opt/dpm-collector` 就地安裝則會保留正式安裝目錄。腳本結束後請依提示執行：
+
+```bash
+cd /opt/dpm-collector
+```
+
+Shell 不允許子腳本直接更改呼叫端的目前目錄，因此無法由 `install.sh` 自動完成這個 `cd`。
+
 ---
 
 ## 日常操作

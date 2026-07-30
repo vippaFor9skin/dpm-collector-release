@@ -969,6 +969,37 @@ start_service() {
   fi
 }
 
+# 安裝成功後清除安裝來源；就地安裝時來源就是正式安裝目錄，必須保留。
+SOURCE_WAS_REMOVED=0
+cleanup_source_after_success() {
+  local source_real install_real
+  source_real="$(resolve_path "$SOURCE_DIR")"
+  install_real="$(resolve_path "$INSTALL_DIR")"
+
+  if [[ "$source_real" == "$install_real" ]]; then
+    log "來源即正式安裝目錄，保留 $install_real"
+    return
+  fi
+
+  # 不允許刪除正式安裝目錄的上層，避免自訂 INSTALL_DIR 時連安裝成果一起移除。
+  if [[ "$install_real/" == "$source_real/"* ]]; then
+    die "拒絕清除來源 $source_real：它包含正式安裝目錄 $install_real"
+  fi
+
+  # 僅刪除可辨識的 DPM 套件目錄，避免 SOURCE_DIR 判斷異常時誤刪廣泛路徑。
+  if [[ ! -f "$source_real/index.js" && ! -f "$source_real/dist/index.js" ]] || \
+     [[ ! -f "$source_real/install.sh" && ! -f "$source_real/scripts/install.sh" ]]; then
+    die "拒絕清除無法辨識的安裝來源：$source_real"
+  fi
+
+  cd "$install_real"
+  log "清除原始安裝專案：$source_real …"
+  rm -rf -- "$source_real"
+  [[ ! -e "$source_real" ]] || die "無法完整清除原始安裝專案：$source_real"
+  SOURCE_WAS_REMOVED=1
+  log "✅ 已清除原始安裝專案：$source_real"
+}
+
 # 安裝成功後：提示 → 5 秒進度條 → clear → 即時日誌 → status（日誌可 Ctrl+C 離開）。
 finish_install_success() {
   local mode="${1:-install}"
@@ -989,6 +1020,12 @@ finish_install_success() {
   fi
   "$INSTALL_DIR/dpm-ctl.sh" logs -n 30 || true
   "$INSTALL_DIR/dpm-ctl.sh" status || true
+  echo
+  if [[ "$SOURCE_WAS_REMOVED" -eq 1 ]]; then
+    log "✅ 原始安裝專案已刪除"
+  fi
+  log_highlight "install.sh 無法切換呼叫端 Shell 的目錄，請執行："
+  printf '   cd %q\n' "$INSTALL_DIR"
 }
 
 # --- 主流程 ---
@@ -997,6 +1034,13 @@ main() {
   validate_utf8_file "$0"
   log_section "環境"
   detect_system
+  log_section "安裝目標"
+  log_highlight "程式將安裝至：$INSTALL_DIR"
+  if [[ "$SOURCE_DIR" != "$INSTALL_DIR" ]]; then
+    log "安裝成功後將刪除來源：$SOURCE_DIR"
+  else
+    log "目前為就地安裝，將保留正式安裝目錄"
+  fi
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 
   if is_update_mode; then
@@ -1013,6 +1057,7 @@ main() {
     fix_permissions
     log_section "服務"
     start_service
+    cleanup_source_after_success
     finish_install_success update
     exit 0
   fi
@@ -1035,6 +1080,7 @@ main() {
   fix_permissions
   log_section "服務"
   start_service
+  cleanup_source_after_success
   finish_install_success install
 }
 
