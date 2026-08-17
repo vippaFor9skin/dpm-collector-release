@@ -4,25 +4,44 @@
 
 ---
 
-## 安裝前準備
+## 建議：筆電部署精靈（不必用終端機）
 
-- BL118（Ubuntu 20.04 以上）
-- 板載 RS-485 已接到電表（現場實測 Pin 1／Pin 2 → `/dev/ttyAS4`）
-- 向後台取得：**Gateway ID**、**MQTT 密碼**
-- 編輯 `config/device-identities.json`（可先複製 `.example`），填入各台設備的 GUID
+1. 取得 **DPM 設定精靈**
+   - **Windows（建議）**：`dpm-setup-wizard-win.zip`（內含 `.exe`，不必裝 Node）
+   - **Linux／macOS**（或 Windows 備援）：`dpm-setup-wizard` zip／客戶倉（需 Node 18+）
+2. 筆電設 `192.168.3.x`，網線接 BL118 **LAN**
+3. Windows：雙擊 `dpm-setup-wizard.exe`；其他：執行 `start.cmd`／`./start.sh`
+4. 瀏覽器依 **Step 1 → Step 2** 填 GATEWAY_ID、MQTT 密碼、站號與 GUID，按部署
+
+SSH 僅由精靈在背景使用，現場不必手動 `vi` 或下指令。連線帳密預設已內建；若需修改，在畫面操作即可（本次有效，不寫本機設定檔）。
 
 ---
 
-## 安裝
+## 備援：終端機安裝
+
+### 安裝前準備
+
+- BL118（Ubuntu 20.04 以上）
+- 板載 RS-485 已接到電表（現場實測 Pin 1／Pin 2 → `/dev/ttyAS4`）
+- 向後台取得：**Gateway ID**、**MQTT 密碼**、各台設備 **GUID**
+
+### 安裝
 
 ```bash
 sudo git clone https://github.com/vippaFor9skin/dpm-collector-release.git /opt/dpm-collector
 cd /opt/dpm-collector
+# 請先編輯 config/device-identities.json（可複製 .example）
 sudo ./install.sh
 ```
 
 依畫面輸入 Gateway ID、序列埠、Modbus 站號、MQTT 密碼即可。  
-腳本會自動安裝 Node.js、依賴，並以 systemd 啟動服務。本機 SQLite 預設保留 7 天；已成功上報 MQTT 的資料只留作備援、不會重送。
+腳本會自動安裝 Node.js、依賴，並以 systemd 啟動服務。
+
+若設定檔已由部署精靈寫好，亦可非互動安裝：
+
+```bash
+sudo DPM_NONINTERACTIVE=1 ./install.sh
+```
 
 安裝成功後，若 `install.sh` 是從其他暫存目錄執行，該來源專案會自動刪除；直接在 `/opt/dpm-collector` 就地安裝則會保留正式安裝目錄。腳本結束後請依提示執行：
 
@@ -54,7 +73,7 @@ sudo ./dpm-ctl.sh update      # 拉新版本並更新
 | 狀況 | 怎麼查 |
 |------|--------|
 | 服務起不來 | `sudo ./dpm-ctl.sh check-config` |
-| MQTT 連不上 | 確認 `.env` 的 `MQTT_PASSWORD`；`sudo ./dpm-ctl.sh test-mqtt` |
+| MQTT 連不上 | 確認 `.env` 的 `MQTT_USERNAME`／`MQTT_PASSWORD`（後台站點 MQTT 帳）；`sudo ./dpm-ctl.sh test-mqtt` |
 | Modbus 讀不到 | 確認板載 485A/B 接線與站號；`sudo ./dpm-ctl.sh test-modbus` |
 
 ---

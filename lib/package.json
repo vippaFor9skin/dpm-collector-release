@@ -8,9 +8,10 @@
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20.18.1"
   },
   "dependencies": {
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.5",
     "modbus-serial": "^8.0.19",
     "mqtt": "^5.10.4"

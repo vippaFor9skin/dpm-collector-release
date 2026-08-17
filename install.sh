@@ -11,25 +11,30 @@
 #   - 開發 repo 的 scripts/ 或含 dist/ 的舊布局
 #
 # 主要流程（初次安裝）：
-#   環境檢查 → 同步檔案 → Node.js + npm install → 互動建立 .env
+#   環境檢查 → 同步檔案 → Node.js + npm ci → 互動建立 .env
 #   （GATEWAY_ID、Modbus、MQTT）→ systemd → 權限 → 啟動服務
 #
 # 本地持久化：SQLite 7 天備援（已送標記、逾期刪除；斷網未送列恢復後補送）。
 #
 # 更新模式（is_update_mode）：已有 .env 且 systemd 單元存在時，
-#   保留 .env，僅同步程式、npm install、驗證、重啟。
+#   保留 .env，僅同步程式、npm ci、驗證、重啟。
+#
+# 非互動（筆電部署精靈）：DPM_NONINTERACTIVE=1 且 .env／device-identities 已齊全。
 # =============================================================================
 set -euo pipefail
 
 # --- 可覆寫的安裝參數（環境變數） ---
+DPM_NONINTERACTIVE="${DPM_NONINTERACTIVE:-0}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/dpm-collector}"
 SERVICE_NAME="${SERVICE_NAME:-dpm-collector}"
 SERVICE_USER="${SERVICE_USER:-dpm}"
-NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-24}"
-NODE_ARMV7_MAJOR="${NODE_ARMV7_MAJOR:-22}"
+NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-20}"
+# BL118 出廠常見預裝；缺 Node 時改裝此精確版本（ARMv7 官方 binary）
+NODE_TARGET_VERSION="${NODE_TARGET_VERSION:-20.18.1}"
 CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
-DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://124.219.96.34:1883}"
-DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-dpm_user}"
+DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://mqtt.9rentec.com:1883}"
+# 站點帳：後台自動佈建 mqtt_{projectId}；勿再預填共用 dpm_user 正式密碼
+DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-}"
 DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
 DEFAULT_POLL_INTERVAL_MS="${DEFAULT_POLL_INTERVAL_MS:-60000}"
 DEFAULT_SQLITE_RETENTION_HOURS="${DEFAULT_SQLITE_RETENTION_HOURS:-168}"
@@ -53,12 +58,18 @@ else
 fi
 
 # --- 終端輸出（僅 install 流程使用；不影響服務日誌） ---
-# log_section / log_highlight 在非 TTY（例如 CI）時會降級為純文字。
+# log_section / log_highlight：TTY 或精靈非互動部署（有 TERM）時保留顏色。
 log() { echo "$*" >&2; }
 die() { echo "❌ $*" >&2; exit 1; }
 
+log_color_enabled() {
+  [[ -t 2 ]] || {
+    [[ -n "${DPM_NONINTERACTIVE:-}" && -n "${TERM:-}" && "${TERM}" != "dumb" ]]
+  }
+}
+
 log_section() {
-  if [[ -t 2 ]]; then
+  if log_color_enabled; then
     printf '\n\033[96m【%s】\033[0m\n' "$1" >&2
   else
     printf '\n【%s】\n' "$1" >&2
@@ -66,7 +77,7 @@ log_section() {
 }
 
 log_highlight() {
-  if [[ -t 2 ]]; then
+  if log_color_enabled; then
     printf '\033[96m%s\033[0m\n' "$*" >&2
   else
     printf '%s\n' "$*" >&2
@@ -77,7 +88,7 @@ countdown_progress_bar() {
   local total="${1:-5}"
   local width=40
   local i j n
-  if [[ ! -t 2 ]]; then
+  if ! log_color_enabled; then
     sleep "$total"
     return
   fi
@@ -143,6 +154,9 @@ require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "請以 root 執行：sudo $0"
   fi
+  # SSH／非登入 shell 有時 PATH 過窄，導致 apt 已裝 curl 仍 command not found
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  hash -r 2>/dev/null || true
 }
 
 detect_system() {
@@ -159,6 +173,86 @@ detect_system() {
   fi
 }
 
+# 出廠 InfluxData apt 來源常缺 GPG，僅造成噪音；安裝期間暫時停用（不刪除）
+quiet_broken_apt_repos() {
+  local f
+  shopt -s nullglob
+  for f in /etc/apt/sources.list.d/*influx* /etc/apt/sources.list.d/*Influx*; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == *.dpm-disabled ]] && continue
+    if mv "$f" "${f}.dpm-disabled" 2>/dev/null; then
+      log "已暫時停用損壞的 apt 來源：$(basename "$f")（缺 GPG，不影響本安裝）"
+    fi
+  done
+  shopt -u nullglob
+}
+
+apt_update_soft() {
+  quiet_broken_apt_repos
+  # 單一第三方 repo 失敗不應讓整段安裝中止
+  apt-get update -qq || apt-get update || log "警告：apt-get update 有錯誤，改用既有套件索引繼續"
+}
+
+# 解析可用的 HTTP 下載工具（優先絕對路徑，避免 PATH 怪異）
+resolve_http_get() {
+  if [[ -x /usr/bin/curl ]]; then
+    echo /usr/bin/curl
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    command -v curl
+    return 0
+  fi
+  if [[ -x /usr/bin/wget ]]; then
+    echo /usr/bin/wget
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    command -v wget
+    return 0
+  fi
+  return 1
+}
+
+ensure_http_client() {
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  hash -r 2>/dev/null || true
+  if resolve_http_get >/dev/null; then
+    return 0
+  fi
+  apt_update_soft
+  apt-get install -y ca-certificates curl wget xz-utils || true
+  hash -r 2>/dev/null || true
+  if resolve_http_get >/dev/null; then
+    return 0
+  fi
+  # dpkg 以為已安裝但二進位消失時，強制重裝
+  apt-get install --reinstall -y curl || true
+  hash -r 2>/dev/null || true
+  if resolve_http_get >/dev/null; then
+    return 0
+  fi
+  die "系統找不到 curl／wget（PATH=${PATH}）。請手動：apt-get install --reinstall curl"
+}
+
+# http_download URL OUTPUT_FILE
+http_download() {
+  local url="$1" out="$2" tool
+  ensure_http_client
+  tool="$(resolve_http_get)" || die "找不到 curl／wget"
+  case "$(basename "$tool")" in
+    curl)
+      "$tool" -fsSL "$url" -o "$out"
+      ;;
+    wget)
+      "$tool" -qO "$out" "$url"
+      ;;
+    *)
+      die "不支援的下載工具：$tool"
+      ;;
+  esac
+}
+
 # --- 平台能力 ---
 is_armv7() {
   local arch
@@ -166,46 +260,52 @@ is_armv7() {
   [[ "$arch" == "armhf" || "$arch" == "armv7l" ]]
 }
 
-# --- Node.js（一般平台 24+；ARMv7 使用仍提供官方 binary 的 22.x） ---
-node_major() {
+# --- Node.js（對齊 BL118 出廠：有則沿用 ≥20.18.1；無則裝精確 20.18.1） ---
+node_version_raw() {
   if ! command -v node >/dev/null 2>&1; then
-    echo 0
+    echo ""
     return
   fi
-  node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1
+  node -v 2>/dev/null | sed 's/^v//'
 }
 
-required_node_major() {
-  if is_armv7; then
-    echo "$NODE_ARMV7_MAJOR"
-  else
-    echo "$NODE_MIN_MAJOR"
-  fi
+node_major() {
+  local v
+  v="$(node_version_raw)"
+  [[ -n "$v" ]] || { echo 0; return; }
+  echo "$v" | cut -d. -f1
 }
 
-install_nodejs_armv7() {
-  local major="$NODE_ARMV7_MAJOR"
-  local base_url="https://nodejs.org/dist/latest-v${major}.x"
-  local tmp_dir sums_file archive archive_path install_root version_dir
+# 回傳 0 表示 version_a >= version_b（sort -V）
+version_ge() {
+  local a="$1" b="$2"
+  [[ -n "$a" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | head -n1)" == "$b" ]]
+}
 
-  log "ARMv7 不受 NodeSource 支援，改裝 Node.js 官方 ${major}.x ARMv7 binary …"
-  apt-get install -y ca-certificates curl xz-utils
+install_nodejs_official_tarball() {
+  local version="$1"
+  local arch_label="$2" # linux-armv7l / linux-arm64 / linux-x64
+  local base_url="https://nodejs.org/dist/v${version}"
+  local archive="node-v${version}-${arch_label}.tar.xz"
+  local tmp_dir sums_file archive_path install_root version_dir
+
+  log "下載 Node.js 官方 ${version}（${arch_label}）…"
+  ensure_http_client
+  apt-get install -y ca-certificates xz-utils
   tmp_dir="$(mktemp -d)"
   sums_file="$tmp_dir/SHASUMS256.txt"
-  curl -fsSL "$base_url/SHASUMS256.txt" -o "$sums_file"
-  archive="$(awk -v major="$major" \
-    '$2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-linux-armv7l\\.tar\\.xz$") { print $2; exit }' \
-    "$sums_file")"
-  [[ -n "$archive" ]] || {
-    rm -rf "$tmp_dir"
-    die "Node.js ${major}.x 官方下載區找不到 ARMv7 binary"
-  }
   archive_path="$tmp_dir/$archive"
-  curl -fL "$base_url/$archive" -o "$archive_path"
-  (cd "$tmp_dir" && grep "  $archive\$" SHASUMS256.txt | sha256sum -c -)
+  http_download "$base_url/SHASUMS256.txt" "$sums_file"
+  if ! grep -q "  ${archive}\$" "$sums_file"; then
+    rm -rf "$tmp_dir"
+    die "Node.js ${version} 官方下載區找不到 ${archive}"
+  fi
+  http_download "$base_url/$archive" "$archive_path"
+  (cd "$tmp_dir" && grep "  ${archive}\$" SHASUMS256.txt | sha256sum -c -)
 
   install_root="/usr/local/lib/nodejs"
-  version_dir="${archive%.tar.xz}"
+  version_dir="node-v${version}-${arch_label}"
   mkdir -p "$install_root"
   rm -rf "$install_root/$version_dir"
   tar -xJf "$archive_path" -C "$install_root"
@@ -216,36 +316,45 @@ install_nodejs_armv7() {
     ln -sfn "$install_root/$version_dir/bin/corepack" /usr/local/bin/corepack
   rm -rf "$tmp_dir"
   hash -r
+  export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 }
 
 install_nodejs() {
-  local required_major
-  required_major="$(required_node_major)"
-  log "安裝 Node.js ${required_major}+ …"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y ca-certificates curl gnupg
-    if is_armv7; then
-      install_nodejs_armv7
-    else
-      curl -fsSL "https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x" | bash -
-      apt-get install -y nodejs
-    fi
+  local version="$NODE_TARGET_VERSION"
+  local arch mach
+  log "安裝 Node.js ${version} …"
+  ensure_http_client
+  apt_update_soft
+  apt-get install -y ca-certificates xz-utils
+
+  mach="$(uname -m)"
+  if is_armv7 || [[ "$mach" == "armv7l" ]]; then
+    arch="linux-armv7l"
+  elif [[ "$mach" == "aarch64" || "$mach" == "arm64" ]]; then
+    arch="linux-arm64"
+  elif [[ "$mach" == "x86_64" ]]; then
+    arch="linux-x64"
   else
-    die "不支援的套件管理器，請手動安裝 Node.js ${required_major}+"
+    die "不支援的 CPU 架構（${mach}），請手動安裝 Node.js ${version}"
   fi
+  install_nodejs_official_tarball "$version" "$arch"
   log "Node.js 版本：$(node -v)"
 }
 
 ensure_nodejs() {
-  local major required_major
-  major="$(node_major)"
-  required_major="$(required_node_major)"
-  if [[ "$major" -lt "$required_major" ]]; then
+  local current
+  current="$(node_version_raw)"
+  if [[ -z "$current" ]]; then
+    log "未偵測到 Node.js，改裝 ${NODE_TARGET_VERSION}（對齊 BL118 出廠）…"
     install_nodejs
-  else
-    log "Node.js 已安裝：$(node -v)"
+    return
   fi
+  if version_ge "$current" "$NODE_TARGET_VERSION"; then
+    log "Node.js 已安裝：v${current}（符合 ≥${NODE_TARGET_VERSION}）"
+    return
+  fi
+  log "Node.js v${current} 低於 ${NODE_TARGET_VERSION}，改裝精確版本…"
+  install_nodejs
 }
 
 log_mqtt_defaults() {
@@ -510,6 +619,9 @@ ensure_serial_port_config() {
   fi
 
   log "⚠️  既有 SERIAL_PORT=$configured 無法由核心設定 ${baud} baud，請重新選擇板載 RS-485"
+  if [[ "${DPM_NONINTERACTIVE:-0}" == "1" ]]; then
+    die "非互動模式：SERIAL_PORT=$configured 無法使用，請修正後重試"
+  fi
   selected="$(prompt_serial_port)"
   validate_serial_port_or_die "$selected" "$baud"
   if grep -q '^SERIAL_PORT=' "$env_file"; then
@@ -638,6 +750,8 @@ write_env_file() {
 
   log_section "MQTT"
   log_mqtt_defaults "$mqtt_url" "$mqtt_user" "$monitor_only" "$poll_ms"
+  log "請填後台「高壓用戶站點 → 編輯 → MQTT」的帳密（格式常為 mqtt_{站點編號}）"
+  mqtt_user="$(prompt "請輸入 MQTT_USERNAME（直接 Enter 使用預設「${mqtt_user:-空}」）" "$mqtt_user")"
   mqtt_pass="$(prompt_secret "請輸入 MQTT_PASSWORD（Broker 密碼；直接 Enter 表示空密碼）")"
   if [[ -z "$mqtt_pass" && -z "${DEFAULT_MQTT_PASSWORD:-}" ]]; then
     log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
@@ -665,8 +779,17 @@ env_file_is_complete() {
 }
 
 # 已有 .env 時：完整則保留；否則整份重建。
+# DPM_NONINTERACTIVE=1：禁止互動 prompt，缺檔或不完整則失敗（供筆電部署精靈預寫設定）。
 ensure_env_file() {
   local env_file="$1"
+  if [[ "${DPM_NONINTERACTIVE:-0}" == "1" ]]; then
+    if env_file_is_complete "$env_file"; then
+      log "非互動模式：保留既有 .env"
+      return
+    fi
+    die "非互動模式需要完整的 .env（GATEWAY_ID、MODBUS_SLAVE_IDS、SERIAL_PORT）。請先由部署精靈寫入設定。"
+  fi
+
   if [[ ! -f "$env_file" ]]; then
     write_env_file "$env_file"
     return
@@ -820,7 +943,7 @@ try {
   fi
 }
 
-# npm install 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
+# npm ci 在 lib/ 執行，完成後將 node_modules 移至安裝根目錄（與 index.js 並列）。
 # 來源目錄若已含 node_modules（離線包）則直接複製，跳過 npm。
 install_dependencies() {
   local dest="$1"
@@ -832,13 +955,19 @@ install_dependencies() {
   if [[ ! -f "$dest/lib/package.json" ]]; then
     die "找不到 $dest/lib/package.json（請確認為新版客戶 repo 或重新 release:client）"
   fi
-  log "執行 npm install --omit=dev（lib/）…"
+  if [[ ! -f "$dest/lib/package-lock.json" ]]; then
+    die "找不到 $dest/lib/package-lock.json（npm ci 需要 lock；請重新 release:client）"
+  fi
+  log "執行 npm ci --omit=dev（lib/）…"
+  export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+  hash -r 2>/dev/null || true
+  # better-sqlite3 在 ARMv7 若無預編譯套件需現場編譯
+  if is_armv7 && command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y build-essential python3 || log "警告：編譯工具未裝齊；npm ci 若失敗請檢查空間與 apt"
+  fi
   (
     cd "$dest/lib"
-    npm install --omit=dev --no-audit --no-fund \
-      --fetch-retries=5 \
-      --fetch-retry-mintimeout=10000 \
-      --fetch-retry-maxtimeout=120000
+    npm ci --omit=dev --no-audit --no-fund
   )
   rm -rf "$dest/node_modules"
   mv "$dest/lib/node_modules" "$dest/node_modules"
@@ -1007,6 +1136,7 @@ cleanup_source_after_success() {
 }
 
 # 安裝成功後：提示 → 5 秒進度條 → clear → 即時日誌 → status（日誌可 Ctrl+C 離開）。
+# DPM_NONINTERACTIVE=1：略過倒數與 follow 日誌，只印 status（避免 SSH／精靈卡住）。
 finish_install_success() {
   local mode="${1:-install}"
   echo
@@ -1019,6 +1149,10 @@ finish_install_success() {
     echo "   查看日誌：$INSTALL_DIR/dpm-ctl.sh logs"
   fi
   echo
+  if [[ "${DPM_NONINTERACTIVE:-0}" == "1" ]]; then
+    "$INSTALL_DIR/dpm-ctl.sh" status || true
+    return
+  fi
   log_highlight "接下來顯示即時日誌，可按 Ctrl+C 離開（不影響服務運行）"
   countdown_progress_bar 5
   if [[ -t 1 ]]; then
