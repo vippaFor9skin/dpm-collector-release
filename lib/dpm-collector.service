@@ -8,7 +8,7 @@ User=dpm
 Group=dpm
 WorkingDirectory=/opt/dpm-collector
 EnvironmentFile=/opt/dpm-collector/.env
-# better-sqlite3 does not require --experimental-sqlite on supported Node releases
+# 勿設 NODE_OPTIONS=--experimental-sqlite：BL118 預設 Node 20.18.1 會拒絕啟動（exit 9）；better-sqlite3 不需此旗標
 ExecStart=/usr/bin/node /opt/dpm-collector/index.js
 Restart=always
 RestartSec=5
