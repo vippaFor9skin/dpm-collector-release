@@ -97,6 +97,8 @@ cmd_update() {
   fi
   if [[ -f "$INSTALL_DIR/install.sh" ]]; then
     sudo "$INSTALL_DIR/install.sh"
+  elif [[ -f "$INSTALL_DIR/scripts/gateway/install.sh" ]]; then
+    sudo "$INSTALL_DIR/scripts/gateway/install.sh"
   elif [[ -f "$INSTALL_DIR/scripts/install.sh" ]]; then
     sudo "$INSTALL_DIR/scripts/install.sh"
   else

@@ -8,7 +8,7 @@
 #
 # 安裝來源（自動偵測 SOURCE_DIR）：
 #   - 客戶 repo 根目錄（git clone 的 dpm-collector/）
-#   - 開發 repo 的 scripts/ 或含 dist/ 的舊布局
+#   - 開發 repo：scripts/gateway/install.sh（專案根為上兩層）或含 dist/ 的布局
 #
 # 主要流程（初次安裝）：
 #   環境檢查 → 同步檔案 → Node.js + npm ci → 互動建立 .env
@@ -42,7 +42,8 @@ DEFAULT_MONITOR_ONLY="${DEFAULT_MONITOR_ONLY:-0}"
 DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyAS4}"
 MAX_MODBUS_DEVICES="${MAX_MODBUS_DEVICES:-5}"
 
-# 判斷「腳本所在目錄」對應的套件根目錄（支援就地 git clone 安裝）。
+# 判斷「腳本所在目錄」對應的套件根目錄（支援就地 git clone／開發樹安裝）。
+# 客戶倉：install.sh 在根目錄；開發樹：scripts/gateway/install.sh（上兩層為專案根）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/index.js" ]]; then
   SOURCE_DIR="$SCRIPT_DIR"
@@ -52,6 +53,10 @@ elif [[ -f "$SCRIPT_DIR/../index.js" ]]; then
   SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 elif [[ -f "$SCRIPT_DIR/../dist/index.js" ]]; then
   SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+elif [[ -f "$SCRIPT_DIR/../../index.js" ]]; then
+  SOURCE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+elif [[ -f "$SCRIPT_DIR/../../dist/index.js" ]]; then
+  SOURCE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 else
   echo "❌ 找不到 index.js，請在 clone 或解壓後的套件根目錄執行 install.sh"
   exit 1
@@ -701,6 +706,10 @@ MQTT_URL=$mqtt_url
 MQTT_DATA_TOPIC=gw/data/{gatewayId}
 # 啟動設備清單 topic（必填）
 MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
+# 遠端指令（雲→閘道）／維運狀態（閘道→雲）；MQTT_REMOTE_UPDATE=0 可關閉
+MQTT_CMD_TOPIC=gw/cmd/{gatewayId}
+MQTT_STATUS_TOPIC=gw/status/{gatewayId}
+MQTT_REMOTE_UPDATE=1
 
 # 與後台 Gateway 主檔 gateway_id 一致（topic 佔位用，非 MQTT clientId）
 GATEWAY_ID=$gateway_id
@@ -804,51 +813,84 @@ ensure_env_file() {
   write_env_file "$env_file"
 }
 
-# 將 SOURCE_DIR 白名單檔案複製到 INSTALL_DIR；就地安裝時 safe_cp 會跳過同路徑。
+# =============================================================================
+# sync_app_files — 把「安裝來源」的程式白名單同步到正式安裝目錄
+#
+# 【用途】
+#   將 SOURCE_DIR（git clone／暫存解壓）裡執行期需要的檔案，
+#   複製到 dest（通常是 /opt/dpm-collector）。不裝 Node、不寫 .env、不動 systemd。
+#   之後才由 install_dependencies／ensure_env_file／install_systemd_unit 等接手。
+#
+# 【誰呼叫】
+#   main() 首次安裝、main() 更新模式（is_update_mode）各呼叫一次。
+#
+# 【會同步什麼】（白名單，不是整棵目錄 rsync）
+#   - index.js、VERSION（客戶 bundle 或開發樹 dist/）
+#   - lib/package.json、package-lock、dpm-collector.service
+#   - dpm-ctl.sh、dpm-remote-update.sh（維運／遠端更新腳本）
+#   - config/device-identities.json(.example)、.env.example（若有）
+#
+# 【不會動什麼】
+#   - 既有 .env、data/*.db（現場設定與 SQLite 備援保留）
+#   - node_modules（另由 install_dependencies 的 npm ci 重建）
+#
+# 【就地安裝】
+#   SOURCE_DIR == INSTALL_DIR 時，safe_cp 對同路徑多為 no-op；仍會 mkdir／chmod。
+#
+# @param $1 dest  正式安裝目錄（INSTALL_DIR）
+# =============================================================================
 sync_app_files() {
   local dest="$1"
+
+  # 舊版曾把 bundle 放在 dest/dist/；若偵測到則先搬成現行列根目錄 layout
   migrate_legacy_dist_layout "$dest"
   log "同步程式檔案到 $dest …"
   mkdir -p "$dest/config" "$dest/data" "$dest/lib"
+
+  # --- 主程式 bundle + 版號檔 ---
   if [[ -f "$SOURCE_DIR/index.js" ]]; then
+    # 客戶倉／已同步：根目錄即有 index.js
     safe_cp "$SOURCE_DIR/index.js" "$dest/index.js"
     [[ -f "$SOURCE_DIR/VERSION" ]] && safe_cp "$SOURCE_DIR/VERSION" "$dest/VERSION"
   elif [[ -f "$SOURCE_DIR/dist/index.js" ]]; then
+    # 開發樹直接 install：從 dist/ 取出 build 產物
     safe_cp "$SOURCE_DIR/dist/index.js" "$dest/index.js"
     [[ -f "$SOURCE_DIR/dist/VERSION" ]] && safe_cp "$SOURCE_DIR/dist/VERSION" "$dest/VERSION"
   fi
+
+  # --- npm 依賴定義與 systemd 單元範本（正式路徑一律放 dest/lib/）---
   if [[ -f "$SOURCE_DIR/lib/package.json" ]]; then
     safe_cp "$SOURCE_DIR/lib/package.json" "$dest/lib/package.json"
     safe_cp "$SOURCE_DIR/lib/package-lock.json" "$dest/lib/package-lock.json"
     [[ -f "$SOURCE_DIR/lib/dpm-collector.service" ]] && \
       safe_cp "$SOURCE_DIR/lib/dpm-collector.service" "$dest/lib/dpm-collector.service"
   elif [[ -f "$SOURCE_DIR/package.json" ]]; then
-    # 相容舊版客戶 repo 根目錄 layout
+    # 相容舊版客戶 repo：package.json 曾在根目錄
     safe_cp "$SOURCE_DIR/package.json" "$dest/lib/package.json"
     safe_cp "$SOURCE_DIR/package-lock.json" "$dest/lib/package-lock.json"
     [[ -f "$SOURCE_DIR/dpm-collector.service" ]] && \
       safe_cp "$SOURCE_DIR/dpm-collector.service" "$dest/lib/dpm-collector.service"
   fi
+
   [[ -f "$SOURCE_DIR/.env.example" ]] && safe_cp "$SOURCE_DIR/.env.example" "$dest/.env.example"
-  # device-identities.json.example 僅供參考，始終同步
+
+  # --- 設備身分：範本始終覆蓋同步；正式 json 則保護現場已填內容 ---
   if [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
     safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest/config/device-identities.json.example"
   fi
-  # 從來源同步 device-identities.json（優先取正式檔，無則從 .example 建立）
   local dest_json="$dest/config/device-identities.json"
   if [[ -f "$SOURCE_DIR/config/device-identities.json" ]]; then
     local src_json_size
     src_json_size=$(wc -c < "$SOURCE_DIR/config/device-identities.json" 2>/dev/null || echo 0)
     if [[ "$src_json_size" -gt 3 ]]; then
-      # 來源有正式內容的 device-identities.json
+      # 來源有非空正式檔
       if [[ ! -f "$dest_json" ]]; then
-        # 目標不存在 → 直接複製
         safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
         log "已從來源同步 config/device-identities.json"
       elif cmp -s "$SOURCE_DIR/config/device-identities.json" "$dest_json" 2>/dev/null; then
         : # 內容相同，無需動作
       else
-        # 目標已存在且內容不同 → 詢問使用者
+        # 現場已有不同內容：互動才覆寫，避免更新踩掉 GUID
         if [[ -t 0 ]] && prompt_yes_no "來源 config/device-identities.json 與安裝目錄不同，是否覆寫？" "n"; then
           safe_cp "$SOURCE_DIR/config/device-identities.json" "$dest_json"
           log "已覆寫 config/device-identities.json"
@@ -858,16 +900,48 @@ sync_app_files() {
       fi
     fi
   elif [[ ! -f "$dest_json" ]] && [[ -f "$SOURCE_DIR/config/device-identities.json.example" ]]; then
-    # 來源無正式檔，但目標也不存在 → 從 .example 建立
+    # 兩邊都沒正式檔 → 從範本長出一份供工程師填
     safe_cp "$SOURCE_DIR/config/device-identities.json.example" "$dest_json"
     log "已從範本建立 config/device-identities.json（請依現場修改）"
   fi
+
+  # --- 本腳本自身：開發樹在 scripts/gateway/，客戶倉在根目錄 ---
+  if [[ -f "$SOURCE_DIR/install.sh" ]]; then
+    safe_cp "$SOURCE_DIR/install.sh" "$dest/install.sh"
+    chmod +x "$dest/install.sh"
+  elif [[ -f "$SOURCE_DIR/scripts/gateway/install.sh" ]]; then
+    safe_cp "$SOURCE_DIR/scripts/gateway/install.sh" "$dest/install.sh"
+    chmod +x "$dest/install.sh"
+  elif [[ -f "$SCRIPT_DIR/install.sh" && "$SCRIPT_DIR" != "$dest" ]]; then
+    # 正在執行的這份（scripts/gateway/install.sh）拷到正式目錄
+    safe_cp "$SCRIPT_DIR/install.sh" "$dest/install.sh"
+    chmod +x "$dest/install.sh"
+  fi
+
+  # --- 現場維運：dpm-ctl（status／logs／手動 update）---
   if [[ -f "$SOURCE_DIR/dpm-ctl.sh" ]]; then
     safe_cp "$SOURCE_DIR/dpm-ctl.sh" "$dest/dpm-ctl.sh"
     chmod +x "$dest/dpm-ctl.sh"
+  elif [[ -f "$SOURCE_DIR/scripts/gateway/dpm-ctl.sh" ]]; then
+    # 開發樹：scripts/gateway/
+    safe_cp "$SOURCE_DIR/scripts/gateway/dpm-ctl.sh" "$dest/dpm-ctl.sh"
+    chmod +x "$dest/dpm-ctl.sh"
   elif [[ -f "$SOURCE_DIR/scripts/dpm-ctl.sh" ]]; then
+    # 相容舊開發樹路徑 scripts/
     safe_cp "$SOURCE_DIR/scripts/dpm-ctl.sh" "$dest/dpm-ctl.sh"
     chmod +x "$dest/dpm-ctl.sh"
+  fi
+
+  # --- 遠端更新入口原稿（稍後由 install_remote_update_privileges 再拷到 /usr/local/sbin）---
+  if [[ -f "$SOURCE_DIR/dpm-remote-update.sh" ]]; then
+    safe_cp "$SOURCE_DIR/dpm-remote-update.sh" "$dest/dpm-remote-update.sh"
+    chmod +x "$dest/dpm-remote-update.sh"
+  elif [[ -f "$SOURCE_DIR/scripts/gateway/dpm-remote-update.sh" ]]; then
+    safe_cp "$SOURCE_DIR/scripts/gateway/dpm-remote-update.sh" "$dest/dpm-remote-update.sh"
+    chmod +x "$dest/dpm-remote-update.sh"
+  elif [[ -f "$SOURCE_DIR/scripts/dpm-remote-update.sh" ]]; then
+    safe_cp "$SOURCE_DIR/scripts/dpm-remote-update.sh" "$dest/dpm-remote-update.sh"
+    chmod +x "$dest/dpm-remote-update.sh"
   fi
 
   local src_real dest_real
@@ -876,6 +950,64 @@ sync_app_files() {
   if [[ "$src_real" == "$dest_real" ]]; then
     log "來源與安裝目錄相同（git clone 就地安裝），略過重複複製"
   fi
+}
+
+# =============================================================================
+# install_remote_update_privileges — 讓服務帳號 dpm 能安全執行遠端 update／restart
+#
+# 【用途】
+#   MQTT 遠端更新時，採集行程（User=dpm）會執行：
+#     sudo -n /usr/local/sbin/dpm-remote-update update|restart
+#   本函式負責：
+#     1) 把 INSTALL_DIR/dpm-remote-update.sh 安裝成固定路徑 /usr/local/sbin/…
+#     2) 寫入限縮 sudoers（僅允許上述兩個子命令、NOPASSWD）
+#   不做 git pull、不重啟服務；那些由 dpm-remote-update → dpm-ctl 負責。
+#
+# 【誰呼叫】
+#   main() 首次安裝（ensure_service_user／install_systemd_unit 之後）、
+#   main() 更新模式（sync_app_files 之後；確保新版腳本與 sudoers 一併更新）。
+#
+# 【依賴】
+#   須先跑過 sync_app_files，INSTALL_DIR 才有 dpm-remote-update.sh；
+#   找不到原稿則警告並略過（舊包相容，遠端更新會因 sudo 失敗而無法用）。
+#
+# 【與 sync_app_files 的分工】
+#   sync_app_files          → 檔案進 /opt/dpm-collector（含腳本原稿）
+#   本函式                  → 系統入口 /usr/local/sbin + sudoers 白名單
+# =============================================================================
+install_remote_update_privileges() {
+  local src="$INSTALL_DIR/dpm-remote-update.sh"
+  local bin="/usr/local/sbin/dpm-remote-update"
+  local sudoers_file="/etc/sudoers.d/dpm-collector-remote-update"
+
+  if [[ ! -f "$src" ]]; then
+    log "警告：找不到 $src，略過遠端更新 sudoers"
+    return 0
+  fi
+
+  # 原稿可執行；再拷到 sbin 固定名（與 remoteUpdate.js 的 REMOTE_BIN 一致）
+  chmod 755 "$src"
+  safe_cp "$src" "$bin"
+  chmod 755 "$bin"
+
+  # 先寫暫存再 visudo 檢查，避免壞掉的 sudoers 直接落地
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# Managed by dpm-collector install.sh — MQTT remote update / restart
+# 僅允許服務帳號執行固定路徑白名單子命令（禁止任意 shell）
+${SERVICE_USER} ALL=(root) NOPASSWD: ${bin} update, ${bin} restart
+EOF
+  chmod 440 "$tmp"
+  if command -v visudo >/dev/null 2>&1; then
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      die "sudoers 語法檢查失敗（遠端更新）"
+    fi
+  fi
+  mv -f "$tmp" "$sudoers_file"
+  chmod 440 "$sudoers_file"
+  log "已安裝遠端更新：$bin 與 $sudoers_file"
 }
 
 ensure_git_safe_directory() {
@@ -986,6 +1118,7 @@ ensure_service_user() {
 install_systemd_unit() {
   local unit_src="$SOURCE_DIR/lib/dpm-collector.service"
   [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/dpm-collector.service"
+  [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/scripts/gateway/dpm-collector.service"
   [[ -f "$unit_src" ]] || unit_src="$SOURCE_DIR/scripts/dpm-collector.service"
   [[ -f "$unit_src" ]] || die "找不到 dpm-collector.service（lib/ 或舊版根目錄）"
 
@@ -1022,6 +1155,7 @@ fix_permissions() {
   find "$data_dir" -type f -exec chmod 660 {} \; 2>/dev/null || true
 
   chmod 775 "$INSTALL_DIR/dpm-ctl.sh" "$INSTALL_DIR/install.sh" 2>/dev/null || true
+  chmod 775 "$INSTALL_DIR/dpm-remote-update.sh" 2>/dev/null || true
   [[ -f "$INSTALL_DIR/.env" ]] && chmod 640 "$INSTALL_DIR/.env"
 
   # 根目錄允許 ls / cd；寫入仍限擁有者（與群組成員）
@@ -1123,7 +1257,7 @@ cleanup_source_after_success() {
 
   # 僅刪除可辨識的 DPM 套件目錄，避免 SOURCE_DIR 判斷異常時誤刪廣泛路徑。
   if [[ ! -f "$source_real/index.js" && ! -f "$source_real/dist/index.js" ]] || \
-     [[ ! -f "$source_real/install.sh" && ! -f "$source_real/scripts/install.sh" ]]; then
+     [[ ! -f "$source_real/install.sh" && ! -f "$source_real/scripts/gateway/install.sh" && ! -f "$source_real/scripts/install.sh" ]]; then
     die "拒絕清除無法辨識的安裝來源：$source_real"
   fi
 
@@ -1194,6 +1328,8 @@ main() {
     install_dependencies "$INSTALL_DIR"
     ensure_serial_port_config "$INSTALL_DIR/.env"
     validate_runtime_config "$INSTALL_DIR"
+    ensure_service_user
+    install_remote_update_privileges
     fix_permissions
     log_section "服務"
     start_service
@@ -1216,6 +1352,7 @@ main() {
   log_section "systemd"
   ensure_service_user
   install_systemd_unit
+  install_remote_update_privileges
   validate_runtime_config "$INSTALL_DIR"
   fix_permissions
   log_section "服務"

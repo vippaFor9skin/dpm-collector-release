@@ -66,6 +66,13 @@ sudo ./dpm-ctl.sh update      # 拉新版本並更新
 
 改過 `.env` 或 `config/device-identities.json` 後，請執行 `restart`。
 
+### 遠端更新（MQTT）
+
+閘道連上 MQTT 後會訂閱 `gw/cmd/{GATEWAY_ID}`。辦公室可用維運帳對該 topic 下發
+`{"message_kind":"cmd","command":"update","request_id":"…"}`，閘道會自行
+`git pull` 並重跑安裝更新（與上方 `dpm-ctl update` 相同）。結果回報在
+`gw/status/{GATEWAY_ID}`。關閉：`.env` 設 `MQTT_REMOTE_UPDATE=0` 後重啟服務。
+
 ---
 
 ## 常見問題
