@@ -19,7 +19,7 @@
 #   - 參數僅允許單一子命令 update｜restart
 #   - flock 防止連收兩則指令重入
 #
-# 【對照】辦公室觸發腳本：scripts/remote/mqtt-trigger-remote-update.sh（只發 MQTT）
+# 【對照】辦公室觸發：npm run remote → scripts/remote/mqtt-remote.sh（只發 MQTT）
 # =============================================================================
 
 set -euo pipefail

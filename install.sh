@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — DPM-DA530（DPM-DA510）Modbus RTU Collector 一鍵安裝／更新（BL118）
+# install.sh — Modbus RTU Collector 一鍵安裝／更新（BL118）
 #
-# 目標平台：僅限 BLIIOT BL118 工業閘道器（ARMv7），搭配 DPM-DA530（DPM-DA510）電表，
+# 目標平台：僅限 BLIIOT BL118 工業閘道器（ARMv7），電表可選
+# DPM-DA530（DPM-DA510）或 CPM-12D（閘道統一型號、不可混接）。
 # 現場實測 Pin 1 / Pin 2 對應 /dev/ttyAS4。
 # 執行方式：sudo ./install.sh（須 root，用於 apt、systemd、chown）。
 #
@@ -33,6 +34,9 @@ NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-20}"
 NODE_TARGET_VERSION="${NODE_TARGET_VERSION:-20.18.1}"
 CLIENT_GIT_REPO_URL="${CLIENT_GIT_REPO_URL:-https://github.com/vippaFor9skin/dpm-collector-release.git}"
 DEFAULT_MQTT_URL="${DEFAULT_MQTT_URL:-mqtt://mqtt.9rentec.com:1883}"
+DEFAULT_MQTT_URL_PROD="${DEFAULT_MQTT_URL_PROD:-mqtt://mqtt.9rentec.com:1883}"
+DEFAULT_MQTT_URL_TEST="${DEFAULT_MQTT_URL_TEST:-mqtt://demo-mqtt.9rentec.com:1883}"
+DEFAULT_MQTT_TARGETS="${DEFAULT_MQTT_TARGETS:-both}"
 # 站點帳：後台自動佈建 mqtt_{projectId}；勿再預填共用 dpm_user 正式密碼
 DEFAULT_MQTT_USERNAME="${DEFAULT_MQTT_USERNAME:-}"
 DEFAULT_MQTT_PASSWORD="${DEFAULT_MQTT_PASSWORD:-}"
@@ -428,6 +432,30 @@ prompt_yes_no() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
+# 閘道統一電表型號（同一 SERIAL_PORT 不可混接）。
+# 回傳：dpm-da530 或 cpm-12d（通訊一律 9600 8N2，僅暫存器 map 不同）
+prompt_meter_model() {
+  local choice
+  echo "請選擇電表型號（同一閘道所有站號須同型，不可混接）：" >&2
+  echo "  1) DPM-DA530" >&2
+  echo "  2) CPM-12D（預設）" >&2
+  echo "  （通訊皆為 9600 8N2；差異僅在暫存器對照）" >&2
+  while true; do
+    read -rp "? 請選擇 （預設 2）: " choice >&2
+    choice="${choice:-2}"
+    case "$choice" in
+      1|dpm|dpm-da530|DPM-DA530) echo "dpm-da530"; return 0 ;;
+      2|cpm|cpm-12d|CPM-12D) echo "cpm-12d"; return 0 ;;
+      *) log "⚠️  請輸入 1 或 2" ;;
+    esac
+  done
+}
+
+# 通訊預設固定 9600／stopBits=2（兩型號相同）
+meter_serial_defaults() {
+  echo "9600 2"
+}
+
 # 先問串接電表台數（1~MAX_MODBUS_DEVICES），再問站號與序列埠。
 prompt_device_count() {
   local raw count
@@ -640,6 +668,8 @@ ensure_serial_port_config() {
 }
 
 # 寫入含中文備註的 .env（欄位說明對照開發倉 .env.example）。
+# 參數：env_file serial_port slave_ids monitor_only poll_ms mqtt_url mqtt_user mqtt_pass gateway_id
+#       [meter_model] [baud] [stop_bits]
 write_env_file_content() {
   local env_file="$1"
   local serial_port="$2"
@@ -650,6 +680,24 @@ write_env_file_content() {
   local mqtt_user="$7"
   local mqtt_pass="$8"
   local gateway_id="$9"
+  local meter_model="${10:-cpm-12d}"
+  local baud_rate="${11:-9600}"
+  local stop_bits="${12:-2}"
+  local mqtt_targets="${13:-$DEFAULT_MQTT_TARGETS}"
+  local mqtt_url_prod="${14:-$DEFAULT_MQTT_URL_PROD}"
+  local mqtt_url_test="${15:-$DEFAULT_MQTT_URL_TEST}"
+  local mqtt_user_prod="${16:-$mqtt_user}"
+  local mqtt_pass_prod="${17:-$mqtt_pass}"
+  local mqtt_user_test="${18:-$mqtt_user}"
+  local mqtt_pass_test="${19:-$mqtt_pass}"
+
+  case "$mqtt_targets" in
+    prod|test|both) ;;
+    *) mqtt_targets="both" ;;
+  esac
+  [[ -n "$mqtt_url_prod" ]] || mqtt_url_prod="$DEFAULT_MQTT_URL_PROD"
+  [[ -n "$mqtt_url_test" ]] || mqtt_url_test="$DEFAULT_MQTT_URL_TEST"
+  [[ -n "$mqtt_url" ]] || mqtt_url="$mqtt_url_prod"
 
   local env_tmp="${env_file}.tmp.$$"
   cat > "$env_tmp" <<EOF
@@ -659,12 +707,18 @@ write_env_file_content() {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# 電表型號（閘道統一；同一 SERIAL_PORT 不可混接）
+# dpm-da530｜cpm-12d（別名 dpm-da510 → 同 dpm map）
+# ---------------------------------------------------------------------------
+METER_MODEL=$meter_model
+
+# ---------------------------------------------------------------------------
 # 序列埠（BL118 現場實測：Pin 1 / Pin 2 → /dev/ttyAS4）
 # ---------------------------------------------------------------------------
 SERIAL_PORT=$serial_port
-MODBUS_BAUD_RATE=9600
+MODBUS_BAUD_RATE=$baud_rate
 MODBUS_DATA_BITS=8
-MODBUS_STOP_BITS=2
+MODBUS_STOP_BITS=$stop_bits
 MODBUS_PARITY=none
 # 多設備輪詢（最多 5 台，逗號分隔；同一 SERIAL_PORT 串接；須與 config/device-identities.json 的 key 一致）
 MODBUS_SLAVE_IDS=$slave_ids
@@ -701,6 +755,9 @@ OUTBOX_FLUSH_BATCH=200
 # MQTT（MONITOR_ONLY=0 時必填）
 # 每筆為 UTF-8 JSON：guid, parameters, sampled_at
 # ---------------------------------------------------------------------------
+MQTT_TARGETS=$mqtt_targets
+MQTT_URL_PROD=$mqtt_url_prod
+MQTT_URL_TEST=$mqtt_url_test
 MQTT_URL=$mqtt_url
 # 週期資料 topic；佔位僅支援 {gatewayId}
 MQTT_DATA_TOPIC=gw/data/{gatewayId}
@@ -710,6 +767,10 @@ MQTT_BOOT_TOPIC=gw/boot/{gatewayId}
 MQTT_CMD_TOPIC=gw/cmd/{gatewayId}
 MQTT_STATUS_TOPIC=gw/status/{gatewayId}
 MQTT_REMOTE_UPDATE=1
+# 每日對帳補傳
+MQTT_SYNC_TOPIC=gw/sync/{gatewayId}
+MQTT_SYNC_REPLY_TOPIC=gw/sync-reply/{gatewayId}
+COVERAGE_SYNC_ENABLED=1
 
 # 與後台 Gateway 主檔 gateway_id 一致（topic 佔位用，非 MQTT clientId）
 GATEWAY_ID=$gateway_id
@@ -717,9 +778,13 @@ GATEWAY_ID=$gateway_id
 # Broker 連線 clientId；留白時以 GATEWAY_ID 帶入
 MQTT_CLIENT_ID=
 
-# Broker 帳密（若 MQTT_URL 未內嵌帳密時使用）
-MQTT_USERNAME=$mqtt_user
-MQTT_PASSWORD=$(format_dotenv_value "$mqtt_pass")
+# 正式／測試站點 MQTT 帳密（通常兩邊不同）
+MQTT_USERNAME_PROD=$mqtt_user_prod
+MQTT_PASSWORD_PROD=$(format_dotenv_value "$mqtt_pass_prod")
+MQTT_USERNAME_TEST=$mqtt_user_test
+MQTT_PASSWORD_TEST=$(format_dotenv_value "$mqtt_pass_test")
+MQTT_USERNAME=
+MQTT_PASSWORD=
 
 # 發布 QoS：0 / 1 / 2
 MQTT_QOS=1
@@ -742,6 +807,9 @@ write_env_file() {
 
   local gateway_id serial_port slave_ids device_count
   local mqtt_url="$DEFAULT_MQTT_URL"
+  local mqtt_url_prod="$DEFAULT_MQTT_URL_PROD"
+  local mqtt_url_test="$DEFAULT_MQTT_URL_TEST"
+  local mqtt_targets="$DEFAULT_MQTT_TARGETS"
   local mqtt_user="$DEFAULT_MQTT_USERNAME"
   local mqtt_pass="$DEFAULT_MQTT_PASSWORD"
   local poll_ms="$DEFAULT_POLL_INTERVAL_MS"
@@ -752,23 +820,56 @@ write_env_file() {
 
   log_section "Modbus"
   log "電表採 RS-485 串接：同一 SERIAL_PORT 輪詢多站號（最多 ${MAX_MODBUS_DEVICES} 台）"
+  log "同一閘道所有站號須為同一型號（不可 DPM 與 CPM 混接）"
+  local meter_model baud_rate stop_bits serial_defs
+  meter_model="$(prompt_meter_model)"
+  serial_defs="$(meter_serial_defaults "$meter_model")"
+  baud_rate="${serial_defs%% *}"
+  stop_bits="${serial_defs##* }"
+  log "已選 ${meter_model}（通訊 ${baud_rate} 8N${stop_bits}，與型號無關）"
   device_count="$(prompt_device_count)"
   slave_ids="$(prompt_slave_ids "$device_count")"
   serial_port="$(prompt_serial_port)"
-  validate_serial_port_or_die "$serial_port" 9600
+  validate_serial_port_or_die "$serial_port" "$baud_rate"
 
   log_section "MQTT"
+  log "上傳目標：1=正式機(mqtt.9rentec.com) 2=測試機(demo-mqtt.9rentec.com) 3=兩者都傳（預設）"
+  local targets_choice
+  targets_choice="$(prompt "請選擇上傳目標 [1/2/3]" "3")"
+  case "$targets_choice" in
+    1|prod) mqtt_targets="prod" ;;
+    2|test) mqtt_targets="test" ;;
+    *) mqtt_targets="both" ;;
+  esac
+  case "$mqtt_targets" in
+    test) mqtt_url="$mqtt_url_test" ;;
+    both) mqtt_url="$mqtt_url_prod" ;;
+    *) mqtt_url="$mqtt_url_prod" ;;
+  esac
   log_mqtt_defaults "$mqtt_url" "$mqtt_user" "$monitor_only" "$poll_ms"
-  log "請填後台「高壓用戶站點 → 編輯 → MQTT」的帳密（格式常為 mqtt_{站點編號}）"
-  mqtt_user="$(prompt "請輸入 MQTT_USERNAME（直接 Enter 使用預設「${mqtt_user:-空}」）" "$mqtt_user")"
-  mqtt_pass="$(prompt_secret "請輸入 MQTT_PASSWORD（Broker 密碼；直接 Enter 表示空密碼）")"
+  log "已選 MQTT_TARGETS=$mqtt_targets"
+  log "請分別填正式／測試後台「高壓用戶站點 → 編輯 → MQTT」帳密（格式常為 mqtt_{站點編號}）"
+  local mqtt_user_prod="" mqtt_pass_prod="" mqtt_user_test="" mqtt_pass_test=""
+  if [[ "$mqtt_targets" == "prod" || "$mqtt_targets" == "both" ]]; then
+    mqtt_user_prod="$(prompt "正式機 MQTT_USERNAME（直接 Enter 使用預設「${mqtt_user:-空}」）" "$mqtt_user")"
+    mqtt_pass_prod="$(prompt_secret "正式機 MQTT_PASSWORD")"
+  fi
+  if [[ "$mqtt_targets" == "test" || "$mqtt_targets" == "both" ]]; then
+    mqtt_user_test="$(prompt "測試機 MQTT_USERNAME（直接 Enter 使用預設「${mqtt_user:-空}」）" "$mqtt_user")"
+    mqtt_pass_test="$(prompt_secret "測試機 MQTT_PASSWORD")"
+  fi
+  mqtt_user="${mqtt_user_prod:-$mqtt_user_test}"
+  mqtt_pass="${mqtt_pass_prod:-$mqtt_pass_test}"
   if [[ -z "$mqtt_pass" && -z "${DEFAULT_MQTT_PASSWORD:-}" ]]; then
-    log "⚠️  MQTT_PASSWORD 為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
+    log "⚠️  MQTT 密碼為空；若 Broker 回 Not authorized，請編輯 .env 補上密碼後重啟服務"
   fi
 
   write_env_file_content "$env_file" \
     "$serial_port" "$slave_ids" "$monitor_only" "$poll_ms" \
-    "$mqtt_url" "$mqtt_user" "$mqtt_pass" "$gateway_id"
+    "$mqtt_url" "$mqtt_user" "$mqtt_pass" "$gateway_id" \
+    "$meter_model" "$baud_rate" "$stop_bits" \
+    "$mqtt_targets" "$mqtt_url_prod" "$mqtt_url_test" \
+    "$mqtt_user_prod" "$mqtt_pass_prod" "$mqtt_user_test" "$mqtt_pass_test"
   chmod 600 "$env_file"
   log "✅ 已建立 $env_file（含 MQTT、Modbus 與本地儲存設定）"
 }

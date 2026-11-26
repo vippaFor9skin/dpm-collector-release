@@ -2,7 +2,7 @@
   "name": "dpm-collector",
   "version": "1.0.0",
   "private": true,
-  "description": "Modbus RTU collector for Delta DPM-DA530 (DPM-DA510) on BLIIOT BL118 via MQTT",
+  "description": "Modbus RTU collector for DPM-DA530/CPM-12D on BLIIOT BL118 via MQTT",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

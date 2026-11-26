@@ -1,6 +1,6 @@
 # DPM 採集程式 — 安裝說明（BL118）
 
-在鋇錸 **BL118** 閘道上讀取 **DPM-DA530（DPM-DA510）**，透過 MQTT 上傳；採樣先寫本機 SQLite（預設保留 7 天），已送過的不重送，逾期刪除。斷網時未送筆會在連上後自動補送。
+在鋇錸 **BL118** 閘道上讀取電表（**DPM-DA530／DPM-DA510** 或 **CPM-12D**，安裝時選擇；同一閘道不可混接），透過 MQTT 上傳；採樣先寫本機 SQLite（預設保留 7 天），已送過的不重送，逾期刪除。斷網時未送筆會在連上後自動補送。
 
 ---
 
@@ -11,9 +11,31 @@
    - **Linux／macOS**（或 Windows 備援）：`dpm-setup-wizard` zip／客戶倉（需 Node 18+）
 2. 筆電設 `192.168.3.x`，網線接 BL118 **LAN**
 3. Windows：雙擊 `dpm-setup-wizard.exe`；其他：執行 `start.cmd`／`./start.sh`
-4. 瀏覽器依 **Step 1 → Step 2** 填 GATEWAY_ID、MQTT 密碼、站號與 GUID，按部署
+4. 瀏覽器依 **Step 1 → Step 2** 填 GATEWAY_ID、MQTT 密碼、**電表型號（DPM／CPM 二選一）**、站號與 GUID，按部署
 
 SSH 僅由精靈在背景使用，現場不必手動 `vi` 或下指令。連線帳密預設已內建；若需修改，在畫面操作即可（本次有效，不寫本機設定檔）。
+
+### 精靈連不上時：手動經 Node-RED 設 SSH 密碼
+
+畫面「經 Node-RED 設密」失敗時，可手動在閘道 Node-RED 把系統 SSH 密碼設回約定值，再回精靈連線。
+
+| 用途 | 常見出廠帳密 |
+|------|----------------|
+| Node-RED 編輯器 | `root`／`123456` |
+| 系統 SSH（精靈用） | 下方會設成 `root`／`bl118rentec` |
+
+1. 瀏覽器開 `http://閘道IP:1880`（例：`http://192.168.3.1:1880`），用編輯器帳密登入
+2. 新增 **inject**（時間戳）→ **exec**，exec 指令：
+
+   ```bash
+   echo "root:bl118rentec" | chpasswd
+   ```
+
+3. inject 勾「立即執行於」**0.1** 秒、重複「無」→ 部署
+4. 回精靈，密碼填 `bl118rentec` →「儲存並連線」
+5. 成功後可刪該暫時 flow；部署完成後建議改成專用 SSH 密碼
+
+詳見設定精靈包內 `README.md` 同名章節。
 
 ---
 
@@ -34,7 +56,7 @@ cd /opt/dpm-collector
 sudo ./install.sh
 ```
 
-依畫面輸入 Gateway ID、序列埠、Modbus 站號、MQTT 密碼即可。  
+依畫面輸入 Gateway ID、**電表型號**、序列埠、Modbus 站號、MQTT 密碼即可。  
 腳本會自動安裝 Node.js、依賴，並以 systemd 啟動服務。
 
 若設定檔已由部署精靈寫好，亦可非互動安裝：
