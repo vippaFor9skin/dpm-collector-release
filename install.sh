@@ -1091,6 +1091,15 @@ install_remote_update_privileges() {
   safe_cp "$src" "$bin"
   chmod 755 "$bin"
 
+  # BL118 等精簡映像可能沒有 /etc/sudoers.d；沒有 sudo 套件時一併補上
+  if [[ ! -d /etc/sudoers.d ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get install -y sudo >/dev/null 2>&1 || true
+    fi
+    mkdir -p /etc/sudoers.d
+    chmod 755 /etc/sudoers.d
+  fi
+
   # 先寫暫存再 visudo 檢查，避免壞掉的 sudoers 直接落地
   local tmp
   tmp="$(mktemp)"
@@ -1194,9 +1203,16 @@ install_dependencies() {
   log "執行 npm ci --omit=dev（lib/）…"
   export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
   hash -r 2>/dev/null || true
-  # better-sqlite3 在 ARMv7 若無預編譯套件需現場編譯
+  # better-sqlite3 在 ARMv7 若無預編譯套件需現場編譯；
+  # Ubuntu 20.04 預設 GCC 9 不認 -std=c++20，需 g++-10
   if is_armv7 && command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y build-essential python3 || log "警告：編譯工具未裝齊；npm ci 若失敗請檢查空間與 apt"
+    apt-get install -y build-essential python3 gcc-10 g++-10 \
+      || log "警告：編譯工具未裝齊；npm ci 若失敗請檢查空間與 apt"
+    if command -v g++-10 >/dev/null 2>&1; then
+      update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-10 >/dev/null 2>&1 || true
+      export CC=gcc-10 CXX=g++-10
+    fi
   fi
   (
     cd "$dest/lib"
