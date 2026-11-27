@@ -1054,14 +1054,14 @@ sync_app_files() {
 }
 
 # =============================================================================
-# install_remote_update_privileges — 讓服務帳號 dpm 能安全執行遠端 update／restart
+# install_remote_update_privileges — 讓服務帳號 dpm 能安全執行遠端維運子命令
 #
 # 【用途】
 #   MQTT 遠端更新時，採集行程（User=dpm）會執行：
-#     sudo -n /usr/local/sbin/dpm-remote-update update|restart
+#     sudo -n /usr/local/sbin/dpm-remote-update <update|restart|set_env|set_identities|get_logs>
 #   本函式負責：
 #     1) 把 INSTALL_DIR/dpm-remote-update.sh 安裝成固定路徑 /usr/local/sbin/…
-#     2) 寫入限縮 sudoers（僅允許上述兩個子命令、NOPASSWD）
+#     2) 寫入限縮 sudoers（僅允許上述白名單子命令、NOPASSWD）
 #   不做 git pull、不重啟服務；那些由 dpm-remote-update → dpm-ctl 負責。
 #
 # 【誰呼叫】
@@ -1104,9 +1104,9 @@ install_remote_update_privileges() {
   local tmp
   tmp="$(mktemp)"
   cat >"$tmp" <<EOF
-# Managed by dpm-collector install.sh — MQTT remote update / restart
+# Managed by dpm-collector install.sh — MQTT remote update / config / logs
 # 僅允許服務帳號執行固定路徑白名單子命令（禁止任意 shell）
-${SERVICE_USER} ALL=(root) NOPASSWD: ${bin} update, ${bin} restart
+${SERVICE_USER} ALL=(root) NOPASSWD: ${bin} update, ${bin} restart, ${bin} set_env, ${bin} set_identities, ${bin} get_logs
 EOF
   chmod 440 "$tmp"
   if command -v visudo >/dev/null 2>&1; then
